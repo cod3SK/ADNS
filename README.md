@@ -1,5 +1,7 @@
 # ADNS — Anomaly Detection Network System
 
+[![CI](https://github.com/OffensiveGeneric/ADNS/actions/workflows/ci.yml/badge.svg)](https://github.com/OffensiveGeneric/ADNS/actions/workflows/ci.yml)
+
 ADNS is an end-to-end demo of a modern network anomaly detection platform. It ingests live packet captures, stores recent flows in PostgreSQL, pushes scoring jobs over Redis/RQ to a DetectionEngine (meta ensemble → sklearn → heuristics), and visualizes detections on a React dashboard with built-in attack simulations for classroom demos.
 
 ## Architecture
@@ -19,6 +21,23 @@ ADNS is an end-to-end demo of a modern network anomaly detection platform. It in
 
 Generated datasets live under `data/`, and derived artifacts (clean CSVs, model outputs) live under `outputs/`; both are gitignored to keep the repo lean.
 
+## Design decisions
+
+The significant design choices are recorded as [Architecture Decision Records](design-decisions/)
+(ADRs). In brief:
+
+- **[Microservice architecture](design-decisions/0001-microservice-architecture.md)** — capture, API, worker, and UI are split so the privileged Linux-only agent never blocks running the rest of the stack, and each service carries only its own dependencies.
+- **[Async scoring with Redis/RQ + inline fallback](design-decisions/0002-async-scoring-redis-rq.md)** — ingestion enqueues scoring and returns fast, but degrades to inline scoring when Redis is down so the demo always works.
+- **[Three-tier detection cascade](design-decisions/0003-three-tier-detection-cascade.md)** — meta ensemble → calibrated sklearn → rule-based heuristic, with hot model reload; the system always produces a score regardless of what is installed.
+- **[Persistence, in-code schema management, and retention](design-decisions/0004-postgres-persistence-and-retention.md)** — PostgreSQL (SQLite-substitutable), self-healing schema migrations on startup, and automatic pruning to stay bounded.
+- **[Feature synthesis for sparse telemetry](design-decisions/0005-feature-synthesis-for-sparse-telemetry.md)** — live `tshark` data is estimated/hashed into the model's full feature vector; documents the resulting train/serve skew honestly.
+- **[Attack simulation subsystem](design-decisions/0006-attack-simulation-subsystem.md)** — `POST /simulate` drives believable threat scenarios through the real scoring path for demos.
+- **[Fail-closed admin-token gate](design-decisions/0007-admin-token-gate-for-response-actions.md)** — the `iptables` response endpoints are disabled unless `ADNS_ADMIN_TOKEN` is set, then require a bearer/header token.
+- **[Externalized configuration and secrets](design-decisions/0008-externalized-configuration-and-secrets.md)** — credentials come from the environment with demo-only defaults; no real secret lives in source.
+- **[Test strategy and CI](design-decisions/0009-test-strategy-and-ci.md)** — tests run against the heuristic + SQLite paths, so the full suite is fast, dependency-light, and runs in CI on every push.
+
+See also the [**model card**](ml/model_card.md) for the detectors' training data, metrics, and limitations.
+
 ## Quickstart — Docker first
 Prereqs: Docker + Docker Compose, Git.
 
@@ -30,8 +49,9 @@ docker compose up --build -d          # API:5000, Frontend:8080, Postgres, Redis
 
 - Frontend: `http://localhost:8080`
 - API health: `curl http://localhost:5000/health`
-- Demo traffic: `curl -X POST http://localhost:5000/simulate -H 'Content-Type: application/json' -d '{"type":"botnet_flood","count":50}'`
-- Streaming demo traffic (background): `curl -X POST http://localhost:5000/simulate -H 'Content-Type: application/json' -d '{"type":"botnet_flood","duration_seconds":120,"interval_seconds":1}'`
+- Demo traffic: `curl -X POST http://localhost:5000/simulate -H 'Content-Type: application/json' -d '{"type":"ddos","count":50}'`
+- Streaming demo traffic (background): `curl -X POST http://localhost:5000/simulate -H 'Content-Type: application/json' -d '{"type":"ddos","duration_seconds":120,"interval_seconds":1}'`
+- Supported simulation `type` values: `attack`, `scanning`, `dos`, `ddos`, `injection`.
 - Live capture (Linux only): `docker compose --profile agent up -d agent` (uses host network + NET_ADMIN; set `INTERFACE`/`API_URL` in `docker-compose.yml` if needed).
 
 ### Local dev (bare metal, optional)
@@ -163,19 +183,44 @@ Copy the resulting artifacts (both `flow_detector.joblib` and `meta_model_combin
 
 ## Demo Tips
 
-- Use the **Attack Simulation Controls** at the top of the dashboard to trigger Botnet Flood, Data Exfiltration, or Port Scan scenarios. They call `/api/simulate`, inject synthetic flows, and immediately refresh the charts/donut.
+- Use the **Attack Simulation Controls** at the top of the dashboard to trigger Attack, Scanning, DoS, DDoS, or Injection scenarios. They call `/api/simulate`, inject synthetic flows, and immediately refresh the charts/donut.
 - The **Threat Timeline** and **Severity Mix** donut help narrate how the model responds as traffic changes.
 - `POST /api/simulate` can also be driven via scripts/cURL for automation:
 
 ```bash
 curl -X POST http://localhost:5000/simulate -H 'Content-Type: application/json' \
-     -d '{"type":"botnet_flood","count":80}'
+     -d '{"type":"ddos","count":80}'
 ```
+
+## Testing
+
+The API ships with a `pytest` suite that runs against a throwaway SQLite database
+in heuristic scoring mode — no PostgreSQL, Redis, or ML artifacts required:
+
+```bash
+cd api
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-test.txt
+python -m pytest
+```
+
+CI (GitHub Actions, `.github/workflows/ci.yml`) runs these tests plus the frontend
+lint/build on every push and pull request.
+
+## Security notes
+
+- The network-response endpoints (`/block_ip`, `/unblock_ip`, `/killswitch`) shell
+  out to `iptables` on the host namespace. They are **disabled by default** and only
+  become active when `ADNS_ADMIN_TOKEN` is set; callers must then send
+  `Authorization: Bearer <token>` (or `X-Admin-Token: <token>`).
+- Database credentials are read from the environment (`POSTGRES_USER`,
+  `POSTGRES_PASSWORD`, `POSTGRES_DB`). The committed defaults are for local demos
+  only — set real values in `.env` before any non-local deployment.
 
 ## Contributing
 
 - Python code follows PEP 8; React follows the Vite ESLint defaults.
-- Add tests near the subsystem you touch (`api/tests`, `ml/tests`, `frontend/.../__tests__`).
+- Add tests near the subsystem you touch (`api/tests` exists; add `ml/tests`, `frontend/.../__tests__` as needed).
 - Keep secrets in `.env` (already gitignored), and add any new large/generated directories to `.gitignore`.
 - Use short imperative commit messages and include screenshots or metrics when changing UI/ML behavior.
 
