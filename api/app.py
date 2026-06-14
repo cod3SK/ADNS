@@ -1,3 +1,4 @@
+import hmac
 import os
 import random
 import shutil
@@ -5,6 +6,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -30,6 +32,48 @@ FLOW_RETENTION_MAX_ROWS = int(os.environ.get("ADNS_FLOW_RETENTION_MAX_ROWS", "50
 KILL_SWITCH_STATE = {"enabled": False}
 KILL_SWITCH_INTERFACE = os.environ.get("ADNS_KILLSWITCH_INTERFACE", "eth0")
 USE_NSENTER = os.environ.get("ADNS_NSENTER_HOST", "true").lower() not in {"0", "false", "no"}
+# Network-response endpoints (block/unblock/killswitch) shell out to iptables
+# on the host namespace, so they are gated behind a shared admin token. When the
+# token is unset the endpoints stay disabled — fail closed rather than open.
+ADMIN_TOKEN = os.environ.get("ADNS_ADMIN_TOKEN", "").strip()
+
+
+def _extract_request_token() -> str:
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.headers.get("X-Admin-Token", "").strip()
+
+
+def _require_admin_token_now():
+    """Return an error response if the request lacks a valid admin token, else None."""
+    if not ADMIN_TOKEN:
+        return (
+            jsonify(
+                {
+                    "error": "endpoint disabled",
+                    "detail": "set ADNS_ADMIN_TOKEN to enable network-response actions",
+                }
+            ),
+            403,
+        )
+    provided = _extract_request_token()
+    if not provided or not hmac.compare_digest(provided, ADMIN_TOKEN):
+        return jsonify({"error": "unauthorized"}), 401
+    return None
+
+
+def require_admin_token(view):
+    """Guard destructive network-response endpoints with a shared token."""
+
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        guard = _require_admin_token_now()
+        if guard is not None:
+            return guard
+        return view(*args, **kwargs)
+
+    return wrapper
 
 PROTOCOL_MAP = {
     "1": "ICMP",
@@ -949,6 +993,7 @@ def anomalies():
 
 
 @app.post("/block_ip")
+@require_admin_token
 def block_ip():
     payload = request.get_json(silent=True) or {}
     ip = str(payload.get("ip") or "").strip()
@@ -976,6 +1021,7 @@ def blocked_ips():
 
 
 @app.post("/unblock_ip")
+@require_admin_token
 def unblock_ip():
     payload = request.get_json(silent=True) or {}
     ip = str(payload.get("ip") or "").strip()
@@ -993,6 +1039,11 @@ def unblock_ip():
 @app.route("/killswitch", methods=["GET", "POST"])
 def killswitch():
     if request.method == "POST":
+        # Mutating the kill switch shells out to iptables; gate it on the token.
+        # Reading the current state (GET) is harmless and stays open.
+        guard = _require_admin_token_now()
+        if guard is not None:
+            return guard
         payload = request.get_json(silent=True) or {}
         enabled = bool(payload.get("enabled"))
         KILL_SWITCH_STATE["enabled"] = enabled

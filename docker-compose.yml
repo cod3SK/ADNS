@@ -4,9 +4,9 @@ services:
   postgres:
     image: postgres:15
     environment:
-      POSTGRES_USER: adns
-      POSTGRES_PASSWORD: adns_password
-      POSTGRES_DB: adns
+      POSTGRES_USER: ${POSTGRES_USER:-adns}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adns_password}
+      POSTGRES_DB: ${POSTGRES_DB:-adns}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -34,7 +34,7 @@ services:
       - SYS_ADMIN
     environment:
       FLASK_APP: app.py
-      SQLALCHEMY_DATABASE_URI: postgresql://adns:adns_password@postgres:5432/adns
+      SQLALCHEMY_DATABASE_URI: postgresql://${POSTGRES_USER:-adns}:${POSTGRES_PASSWORD:-adns_password}@postgres:5432/${POSTGRES_DB:-adns}
       ADNS_REDIS_URL: redis://redis:6379/0
       ADNS_RQ_QUEUE: flow_scores
       ADNS_RQ_JOB_TIMEOUT: 120
@@ -46,6 +46,7 @@ services:
       ADNS_RDNS_TIMEOUT_MS: 500
       ADNS_RDNS_CACHE_TTL: 900
       ADNS_RDNS_CACHE_SIZE: 500
+      ADNS_ADMIN_TOKEN: ${ADNS_ADMIN_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,7 +63,7 @@ services:
     command: ["python", "worker.py"]
     environment:
       FLASK_APP: app.py
-      SQLALCHEMY_DATABASE_URI: postgresql://adns:adns_password@postgres:5432/adns
+      SQLALCHEMY_DATABASE_URI: postgresql://${POSTGRES_USER:-adns}:${POSTGRES_PASSWORD:-adns_password}@postgres:5432/${POSTGRES_DB:-adns}
       ADNS_REDIS_URL: redis://redis:6379/0
       ADNS_RQ_QUEUE: flow_scores
       ADNS_RQ_JOB_TIMEOUT: 120
