@@ -14,7 +14,7 @@ ADNS is an end-to-end demo of a modern network anomaly detection platform. It in
 | Flask API | `api/` | Persists flows/predictions, exposes `/flows`, `/anomalies`, `/simulate`, and enqueues new flow IDs on Redis/RQ. |
 | Redis task queue | `api/task_queue.py`, `api/tasks.py` | RQ helpers that push flow IDs to `flow_scores` and score them inside app context. |
 | Scoring worker | `api/worker.py` | RQ worker bootstrap; consumes `flow_scores` jobs and drives the DetectionEngine. |
-| Frontend dashboard | `frontend/adns-frontend/` | Vite/React UI with anomaly charts, severity donut, and attack simulation buttons. |
+| Frontend dashboard | `frontend/adns-frontend/` | Vite/React UI with anomaly charts and severity donut. |
 | ML lab | `ml/` | Preprocessing scripts (`preprocess/`), meta-model notebooks, and `train_flow_detector.py` for the live scorer. |
 | Model artifacts | `api/model_artifacts/` | `meta_model_combined.joblib` (ExtraTrees+XGBoost) + `flow_detector.joblib` (sklearn pipeline). |
 | Attack generator | `core/attack_generator.py` | Stdlib-only CLI; generates synthetic attack flows and POSTs them to `/ingest` for live demo runs. |
@@ -38,6 +38,35 @@ The significant design choices are recorded as [Architecture Decision Records](d
 - **[Test strategy and CI](design-decisions/0009-test-strategy-and-ci.md)** — tests run against the heuristic + SQLite paths, so the full suite is fast, dependency-light, and runs in CI on every push.
 
 See also the [**model card**](ml/model_card.md) for the detectors' training data, metrics, and limitations.
+
+## Desktop App — Windows (No Setup Required)
+
+If you just want to open ADNS and see it working — no Python, Node.js, or Docker needed:
+
+1. Go to the [Releases page](https://github.com/OffensiveGeneric/ADNS/releases) and download **`ADNS_installer.exe`**.
+2. Run the installer and click **Next** through the wizard. No administrator password is required — it installs to your personal user folder.
+3. When the wizard finishes, click **Launch ADNS now** (or double-click the desktop shortcut any time after that).
+
+The app opens in its own window with everything running inside it. Your data is saved in `%AppData%\ADNS\adns.db` — uninstalling the app leaves that file in place so you don't lose history.
+
+> The first launch may take a few seconds while the detection engine loads — this is normal.
+
+### Building the installer yourself (developers only)
+
+You will need three free tools installed first:
+
+- [Node.js 18+](https://nodejs.org) — download and run the installer, accept all defaults
+- [Python 3.10+](https://python.org/downloads) — download and run the installer; **check "Add Python to PATH"** on the first screen
+- [Inno Setup 6](https://jrsoftware.org/isinfo.php) — download and run the installer, accept all defaults
+
+Then open PowerShell in the repo root and run:
+
+```powershell
+pip install -r requirements-desktop.txt pyinstaller
+pwsh scripts\build_installer.ps1
+```
+
+The finished installer is written to `Output\ADNS_installer.exe`. The GitHub Actions workflow (`.github/workflows/build-installer.yml`) runs the same steps automatically whenever a version tag is pushed and attaches the result to the GitHub Release.
 
 ## Quickstart — Docker first
 Prereqs: Docker + Docker Compose, Git.
@@ -222,10 +251,13 @@ lint/build on every push and pull request.
 
 ## Security notes
 
-- The network-response endpoints (`/block_ip`, `/unblock_ip`, `/killswitch`) shell
-  out to `iptables` on the host namespace. They are **disabled by default** and only
-  become active when `ADNS_ADMIN_TOKEN` is set; callers must then send
-  `Authorization: Bearer <token>` (or `X-Admin-Token: <token>`).
+- The network-response endpoints (`/block_ip`, `/unblock_ip`, `/killswitch`) always
+  record block/unblock actions in the database. The OS-level firewall step
+  (`iptables` on Linux, `netsh advfirewall` on Windows) only runs when
+  `ADNS_ADMIN_TOKEN` is set **and** the caller sends a matching
+  `Authorization: Bearer <token>` (or `X-Admin-Token: <token>`). Without a token
+  the DB is still updated but no firewall rules are touched — fail-safe, not
+  fail-closed, by design.
 - Database credentials are read from the environment (`POSTGRES_USER`,
   `POSTGRES_PASSWORD`, `POSTGRES_DB`). The committed defaults are for local demos
   only — set real values in `.env` before any non-local deployment.
