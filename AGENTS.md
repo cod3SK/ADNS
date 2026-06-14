@@ -49,7 +49,7 @@ Use this page to remind yourself (or other assistants) what lives where in the A
 - **Frontend**: `cd frontend/adns-frontend && npm install && npm run dev` (hot reload) or `npm run build && npm run preview` for production bundle served via Nginx. `dist/` is deployed to `/root/ADNS/frontend/adns-frontend/dist`. Set `VITE_API_URL` before build if the API isn’t on the same origin.
 - **One-shot local setup**: `./scripts/setup_local.sh` creates `.venv`, installs API/agent deps and frontend node_modules, and copies `.env.example` to `.env` if missing.
 - **ML**: `cd ml && pip install -r requirements.txt` then run preprocess/train scripts (see README for exact commands). Copy resulting `.joblib` files into `api/model_artifacts/`.
-- **Testing**: No tests are currently checked in. If you add them, prefer `pytest` for Python and `npx vitest run` for the frontend; mock external systems (Redis, PostgreSQL, tshark) in unit tests.
+- **Testing**: A `pytest` suite lives in `api/tests/` (run `pip install -r api/requirements-test.txt && cd api && python -m pytest`). It uses a throwaway SQLite DB in heuristic mode — no Redis/PostgreSQL/artifacts needed. CI runs it via `.github/workflows/ci.yml`. For the frontend prefer `npx vitest run`; mock external systems (Redis, PostgreSQL, tshark) in unit tests.
 
 ## Operational Notes
 - Production services live under `/var/www/adns/api/app.py` (Gunicorn on 127.0.0.1:5000; Nginx proxies `/api/*`) and `/var/www/adns/agent/capture.py`. The frontend bundle is served from `/root/ADNS/frontend/adns-frontend/dist` by Nginx at `http://159.203.105.167/`.

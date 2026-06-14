@@ -1,0 +1,12 @@
+# Lightweight deps for running the API test suite (heuristic mode).
+# Avoids xgboost/scikit-learn since tests force the model artifacts off.
+flask
+flask-cors
+flask-sqlalchemy
+sqlalchemy
+numpy
+pandas
+joblib
+redis
+rq
+pytest
