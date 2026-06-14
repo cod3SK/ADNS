@@ -1,21 +1,30 @@
-"""Auth-gating tests for the network-response endpoints.
+"""Endpoint tests for network-response actions.
 
-These endpoints shell out to iptables, so they must fail closed when no admin
-token is configured and reject mismatched tokens when one is.
+Block/unblock always update the DB (no token required); iptables is only
+attempted when a valid admin token is present (so it works in environments
+where iptables is available). The killswitch POST remains fully token-gated.
 """
 
 import app as app_module
 
 
-def test_block_ip_disabled_without_token(client):
+def test_block_ip_works_without_token(client):
     resp = client.post("/block_ip", json={"ip": "1.2.3.4"})
-    assert resp.status_code == 403
-    assert resp.get_json()["error"] == "endpoint disabled"
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "blocked"
+    assert body["os_action"] == "not_configured"
+
+    blocked = client.get("/blocked_ips").get_json()
+    assert any(row["ip"] == "1.2.3.4" for row in blocked)
 
 
-def test_unblock_ip_disabled_without_token(client):
-    resp = client.post("/unblock_ip", json={"ip": "1.2.3.4"})
-    assert resp.status_code == 403
+def test_unblock_ip_works_without_token(client, monkeypatch):
+    monkeypatch.setattr(app_module, "block_ip_os", lambda ip, allow=False: (True, ""))
+    client.post("/block_ip", json={"ip": "2.3.4.5"})
+    resp = client.post("/unblock_ip", json={"ip": "2.3.4.5"})
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "unblocked"
 
 
 def test_killswitch_post_disabled_without_token(client):
@@ -24,23 +33,25 @@ def test_killswitch_post_disabled_without_token(client):
 
 
 def test_killswitch_get_is_open(client):
-    # Reading state is harmless and must work without a token.
     resp = client.get("/killswitch")
     assert resp.status_code == 200
     assert resp.get_json() == {"enabled": False}
 
 
-def test_block_ip_rejects_wrong_token(client, admin_token):
+def test_block_ip_wrong_token_skips_os_action(client, admin_token):
     resp = client.post(
         "/block_ip",
-        json={"ip": "1.2.3.4"},
+        json={"ip": "3.4.5.6"},
         headers={"Authorization": "Bearer wrong-token"},
     )
-    assert resp.status_code == 401
+    assert resp.status_code == 200
+    assert resp.get_json()["os_action"] == "not_configured"
+    # IP still recorded in DB
+    blocked = client.get("/blocked_ips").get_json()
+    assert any(row["ip"] == "3.4.5.6" for row in blocked)
 
 
-def test_block_ip_accepts_valid_token(client, admin_token, monkeypatch):
-    # Stub the OS-level iptables call so the test stays platform-independent.
+def test_block_ip_valid_token_triggers_os_action(client, admin_token, monkeypatch):
     monkeypatch.setattr(app_module, "block_ip_os", lambda ip, allow=False: (True, "blocked"))
     resp = client.post(
         "/block_ip",
@@ -50,9 +61,8 @@ def test_block_ip_accepts_valid_token(client, admin_token, monkeypatch):
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["status"] == "blocked"
-    assert body["ip"] == "1.2.3.4"
+    assert body["os_action"] == "ok"
 
-    # The IP should now be recorded as blocked.
     blocked = client.get("/blocked_ips").get_json()
     assert any(row["ip"] == "1.2.3.4" for row in blocked)
 
@@ -65,15 +75,11 @@ def test_block_ip_accepts_x_admin_token_header(client, admin_token, monkeypatch)
         headers={"X-Admin-Token": admin_token},
     )
     assert resp.status_code == 200
+    assert resp.get_json()["os_action"] == "ok"
 
 
-def test_ingest_drops_blocked_ip(client, admin_token, monkeypatch):
-    monkeypatch.setattr(app_module, "block_ip_os", lambda ip, allow=False: (True, "blocked"))
-    client.post(
-        "/block_ip",
-        json={"ip": "9.9.9.9"},
-        headers={"Authorization": f"Bearer {admin_token}"},
-    )
+def test_ingest_drops_blocked_ip(client):
+    client.post("/block_ip", json={"ip": "9.9.9.9"})
     resp = client.post(
         "/ingest",
         json={"src_ip": "9.9.9.9", "dst_ip": "10.0.0.1", "proto": "6", "bytes": 100},

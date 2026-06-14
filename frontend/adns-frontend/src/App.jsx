@@ -22,14 +22,6 @@ const apiBase = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
 // If no base is provided, rely on Vite dev proxy (/api -> http://127.0.0.1:5000)
 const api = axios.create({ baseURL: apiBase });
 
-const SIM_ATTACKS = [
-  { type: "attack", label: "Attack", description: "Generic hostile burst" },
-  { type: "scanning", label: "Scanning", description: "Rapid port sweep" },
-  { type: "dos", label: "DoS", description: "Single-source flood" },
-  { type: "ddos", label: "DDoS", description: "Distributed swarm" },
-  { type: "injection", label: "Injection", description: "SQL/Web payloads" },
-];
-
 const formatLabel = (label) => {
   if (!label) return "Unknown";
   const cleaned = String(label).replace(/_/g, " ").trim();
@@ -73,10 +65,6 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [srcFilter, setSrcFilter] = useState("");
-  const [simBusy, setSimBusy] = useState("");
-  const [simStatus, setSimStatus] = useState(null);
-  const [simDuration, setSimDuration] = useState(0);
-  const [simVisible, setSimVisible] = useState(true);
   const [killSwitch, setKillSwitch] = useState(false);
   const [killBusy, setKillBusy] = useState(false);
   const [blockMessage, setBlockMessage] = useState("");
@@ -154,43 +142,6 @@ export default function App() {
     }
   };
 
-  const triggerSimulation = async (attack) => {
-    setSimBusy(attack.type);
-    setSimStatus({
-      tone: "info",
-      message:
-        simDuration > 0
-          ? `Streaming ${attack.label} for ${simDuration}s…`
-          : `Triggering ${attack.label}…`,
-    });
-    try {
-      const payload = { type: attack.type };
-      const durationInt = parseInt(simDuration, 10);
-      if (!Number.isNaN(durationInt) && durationInt > 0) {
-        payload.duration_seconds = durationInt;
-      }
-      const resp = await api.post("/api/simulate", payload);
-      await fetchLatest();
-      setTimeout(fetchLatest, 1000);
-      setSimStatus({
-        tone: "success",
-        message:
-          resp.data?.status === "streaming"
-            ? `Streaming ${attack.label} for ${resp.data.duration_seconds}s (batch ${resp.data.batch_size}).`
-            : `Generated ${resp.data.generated} flows (${attack.label}).`,
-      });
-    } catch (err) {
-      console.error(err);
-      const apiError = err?.response?.data?.error ?? "server error";
-      setSimStatus({
-        tone: "error",
-        message: `Failed to trigger ${attack.label}: ${apiError}`,
-      });
-    } finally {
-      setSimBusy("");
-    }
-  };
-
   const sortedFlows = useMemo(() => {
     return [...flows].sort((a, b) => new Date(b.ts) - new Date(a.ts));
   }, [flows]);
@@ -265,15 +216,6 @@ export default function App() {
           </p>
         </div>
         <div className="header-actions">
-          {!simVisible && (
-            <button
-              type="button"
-              className="pill-btn ghost-btn"
-              onClick={() => setSimVisible(true)}
-            >
-              Show simulation controls
-            </button>
-          )}
           <div className="kill-switch">
             <button
               type="button"
@@ -287,59 +229,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={`panel-row ${simVisible ? "" : "panel-row-collapsed"}`}>
-        {simVisible && (
-          <section className="panel simulation-panel">
-            <div className="panel-heading">
-              <div className="panel-title-group">
-                <h3>Attack simulation controls</h3>
-                <p>Use these demo buttons to stream synthetic malicious traffic.</p>
-              </div>
-              <button
-                type="button"
-                className="pill-btn ghost-btn"
-                onClick={() => setSimVisible(false)}
-              >
-                Minimize
-              </button>
-            </div>
-            <div className="simulate-controls">
-              <label htmlFor="simDuration">
-                Duration (seconds, 0 for one-shot)
-              </label>
-              <input
-                id="simDuration"
-                type="number"
-                min="0"
-                max="600"
-                value={simDuration}
-                onChange={(e) => setSimDuration(e.target.value)}
-              />
-            </div>
-            <div className="simulate-grid">
-              {SIM_ATTACKS.map((attack) => (
-                <button
-                  key={attack.type}
-                  type="button"
-                  className={`simulate-btn${
-                    simBusy === attack.type ? " is-active" : ""
-                  }`}
-                  onClick={() => triggerSimulation(attack)}
-                  disabled={Boolean(simBusy)}
-                >
-                  <span>{attack.label}</span>
-                  <small>{attack.description}</small>
-                </button>
-              ))}
-            </div>
-            {simStatus?.message && (
-              <p className={`simulate-status ${simStatus.tone}`}>
-                {simStatus.message}
-              </p>
-            )}
-          </section>
-        )}
-
+      <div className="panel-row">
         <section className="panel chart-panel anomaly-panel">
           <div className="panel-heading">
             <h3>Anomalous flows</h3>
@@ -391,9 +281,7 @@ export default function App() {
         </section>
       </div>
 
-      <div
-        className={`content-grid ${simVisible ? "" : "content-grid-collapsed"}`}
-      >
+      <div className="content-grid">
         <div className="main-column">
           {error && <div className="app-alert">{error}</div>}
           {blockMessage && <div className="app-alert">{blockMessage}</div>}
@@ -561,7 +449,6 @@ export default function App() {
                         <Th>Destination IP</Th>
                         <Th>Proto</Th>
                         <Th>Bytes</Th>
-                        <Th>Attack Type</Th>
                         <Th className="col-actions">Actions</Th>
                         <Th className="col-score">Score</Th>
                         <Th className="col-severity">Severity</Th>
@@ -575,7 +462,6 @@ export default function App() {
                           <Td>{f.dst_ip}</Td>
                           <Td>{f.proto}</Td>
                           <Td>{f.bytes}</Td>
-                          <Td>{formatLabel(f.attack_type || f.label)}</Td>
                           <Td clamp={false} className="col-actions">
                             <button
                               type="button"
@@ -663,7 +549,6 @@ export default function App() {
                     <Th>Destination IP</Th>
                     <Th>Proto</Th>
                     <Th>Bytes</Th>
-                    <Th>Attack Type</Th>
                     <Th className="col-actions">Actions</Th>
                     <Th className="col-score">Score</Th>
                     <Th className="col-severity">Severity</Th>
@@ -677,7 +562,6 @@ export default function App() {
                       <Td>{f.dst_ip}</Td>
                       <Td>{f.proto}</Td>
                       <Td>{f.bytes}</Td>
-                      <Td>{formatLabel(f.attack_type || f.label)}</Td>
                       <Td clamp={false} className="col-actions">
                         <button
                           type="button"

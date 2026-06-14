@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/OffensiveGeneric/ADNS/actions/workflows/ci.yml/badge.svg)](https://github.com/OffensiveGeneric/ADNS/actions/workflows/ci.yml)
 
-ADNS is an end-to-end demo of a modern network anomaly detection platform. It ingests live packet captures, stores recent flows in PostgreSQL, pushes scoring jobs over Redis/RQ to a DetectionEngine (meta ensemble → sklearn → heuristics), and visualizes detections on a React dashboard with built-in attack simulations for classroom demos.
+ADNS is an end-to-end demo of a modern network anomaly detection platform. It ingests live packet captures, stores recent flows in PostgreSQL, pushes scoring jobs over Redis/RQ to a DetectionEngine (meta ensemble → sklearn → heuristics), and visualizes detections on a React dashboard. Attack scenarios are driven from the CLI tool in `core/attack_generator.py`, not the dashboard.
 
 ## Architecture
 <img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/3c972f97-f751-4c92-9d10-fb54f326c4b3" />
@@ -17,6 +17,7 @@ ADNS is an end-to-end demo of a modern network anomaly detection platform. It in
 | Frontend dashboard | `frontend/adns-frontend/` | Vite/React UI with anomaly charts, severity donut, and attack simulation buttons. |
 | ML lab | `ml/` | Preprocessing scripts (`preprocess/`), meta-model notebooks, and `train_flow_detector.py` for the live scorer. |
 | Model artifacts | `api/model_artifacts/` | `meta_model_combined.joblib` (ExtraTrees+XGBoost) + `flow_detector.joblib` (sklearn pipeline). |
+| Attack generator | `core/attack_generator.py` | Stdlib-only CLI; generates synthetic attack flows and POSTs them to `/ingest` for live demo runs. |
 | Ops | `deployment/`, `worker/`, `assets/` | Systemd units, scripts, and misc assets. Research docs live in `docs/`. |
 
 Generated datasets live under `data/`, and derived artifacts (clean CSVs, model outputs) live under `outputs/`; both are gitignored to keep the repo lean.
@@ -183,13 +184,25 @@ Copy the resulting artifacts (both `flow_detector.joblib` and `meta_model_combin
 
 ## Demo Tips
 
-- Use the **Attack Simulation Controls** at the top of the dashboard to trigger Attack, Scanning, DoS, DDoS, or Injection scenarios. They call `/api/simulate`, inject synthetic flows, and immediately refresh the charts/donut.
 - The **Threat Timeline** and **Severity Mix** donut help narrate how the model responds as traffic changes.
-- `POST /api/simulate` can also be driven via scripts/cURL for automation:
+- To inject synthetic attack traffic, use the CLI tool in `core/attack_generator.py` (requires only stdlib — no Flask deps):
 
 ```bash
-curl -X POST http://localhost:5000/simulate -H 'Content-Type: application/json' \
-     -d '{"type":"ddos","count":80}'
+# One-shot batch of 80 DDoS flows
+python core/attack_generator.py --type ddos --count 80
+
+# Stream injection flows for 2 minutes
+python core/attack_generator.py --type injection --duration 120 --interval 1
+
+# Supported types: attack, scanning, dos, ddos, injection
+```
+
+- `POST /ingest` (which the generator targets) can also be called directly via cURL:
+
+```bash
+# Minimal single-flow ingest
+curl -X POST http://localhost:5000/ingest -H 'Content-Type: application/json' \
+     -d '[{"src_ip":"10.0.0.1","dst_ip":"8.8.8.8","proto":"TCP","bytes":50000}]'
 ```
 
 ## Testing

@@ -1,0 +1,13 @@
+# Dependencies for the PyInstaller desktop build.
+# Excludes psycopg2 (SQLite only) and alembic (not needed in standalone mode).
+flask
+flask-cors
+flask-sqlalchemy
+pandas
+numpy
+scikit-learn
+joblib
+xgboost==1.7.6
+redis
+rq
+pywebview
