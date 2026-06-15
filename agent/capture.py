@@ -4,6 +4,7 @@
 import logging
 import os
 import subprocess
+import sys
 import time
 from typing import Dict, List, Optional
 
@@ -29,7 +30,12 @@ def _env_float(name: str, default: float) -> float:
 
 
 API_URL = _env_str("API_URL", "http://127.0.0.1:5000/ingest")
-TSHARK_BIN = _env_str("TSHARK_BIN", "/usr/bin/tshark")
+_DEFAULT_TSHARK = (
+    r"C:\Program Files\Wireshark\tshark.exe"
+    if sys.platform == "win32"
+    else "/usr/bin/tshark"
+)
+TSHARK_BIN = _env_str("TSHARK_BIN", _DEFAULT_TSHARK)
 INTERFACE = _env_str("INTERFACE", "eth0")
 BATCH_SIZE = _env_int("BATCH_SIZE", 50)
 POST_INTERVAL = _env_float("POST_INTERVAL", 2.0)  # seconds

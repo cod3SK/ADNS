@@ -2,46 +2,42 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Sequence
-
-from redis import Redis
-from rq import Queue
 
 logger = logging.getLogger(__name__)
 
-_queue: Queue | None = None
-_redis_url = os.environ.get("ADNS_REDIS_URL", "redis://127.0.0.1:6379/0")
+_executor: ThreadPoolExecutor | None = None
 
 
-def _queue_kwargs() -> dict:
-    return {
-        "default_timeout": int(os.environ.get("ADNS_RQ_JOB_TIMEOUT", "120")),
-        "connection": Redis.from_url(_redis_url),
-    }
-
-
-def _get_queue() -> Queue:
-    global _queue
-    if _queue is None:
-        queue_name = os.environ.get("ADNS_RQ_QUEUE", "flow_scores")
-        kwargs = _queue_kwargs()
-        _queue = Queue(queue_name, **kwargs)
-        logger.info("initialized RQ queue '%s' using redis %s", queue_name, _redis_url)
-    return _queue
+def _get_executor() -> ThreadPoolExecutor:
+    global _executor
+    if _executor is None:
+        workers = int(os.environ.get("ADNS_SCORER_WORKERS", "2"))
+        _executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="adns-scorer",
+        )
+        logger.info("initialized scorer thread pool with %d worker(s)", workers)
+    return _executor
 
 
 def enqueue_flow_scoring(flow_ids: Sequence[int]) -> int:
-    """
-    Enqueue one or more flow IDs for asynchronous scoring.
-    Returns the number of IDs enqueued.
-    """
+    """Submit flow IDs to the background scorer thread pool. Returns the count submitted."""
     ids = [int(fid) for fid in flow_ids if fid]
     if not ids:
         return 0
-
-    batch_size = int(os.environ.get("ADNS_RQ_BATCH_SIZE", "100"))
-    queue = _get_queue()
+    batch_size = int(os.environ.get("ADNS_SCORING_BATCH_SIZE", "100"))
+    executor = _get_executor()
     for start in range(0, len(ids), batch_size):
         chunk = ids[start : start + batch_size]
-        queue.enqueue("tasks.score_flow_batch", chunk)
+        executor.submit(_run_batch, chunk)
     return len(ids)
+
+
+def _run_batch(chunk: list[int]) -> None:
+    try:
+        from tasks import score_flow_batch
+        score_flow_batch(chunk)
+    except Exception:
+        logger.exception("background scorer failed for chunk of %d flow(s)", len(chunk))

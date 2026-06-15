@@ -33,6 +33,17 @@ os.environ.pop("ADNS_ADMIN_TOKEN", None)
 import app as app_module  # noqa: E402  (import after env setup is intentional)
 
 
+@pytest.fixture(autouse=True)
+def no_background_scoring(monkeypatch):
+    """Disable the thread-pool scorer for every test.
+
+    Without this, background threads writing predictions to the same SQLite
+    file can race with the clean_tables fixture, causing spurious FK errors
+    and making test isolation unreliable.
+    """
+    monkeypatch.setattr(app_module, "enqueue_flow_scoring", lambda flow_ids: 0)
+
+
 @pytest.fixture(scope="session")
 def flask_app():
     app_module.app.config.update(TESTING=True)

@@ -45,9 +45,7 @@ this file describes the result.
 │       • delete flows older than ADNS_FLOW_RETENTION_MINUTES (30 min) │
 │       • trim to ADNS_FLOW_RETENTION_MAX_ROWS (5 000) if exceeded      │
 │       • deletion runs in batches of 1 000 rows per loop iteration     │
-│  6. enqueue_flow_scoring(flow_ids)  →  see task queue below           │
-│     Fallback: if Redis is unreachable, call score_flow_batch()        │
-│     inline inside the same request (slower but safe).                 │
+│  6. enqueue_flow_scoring(flow_ids)  →  see thread pool below          │
 │                                                                       │
 │  Response: {"status":"ok","ingested":N,"blocked":B,                   │
 │             "purged":P,"queued":Q}                                    │
@@ -55,24 +53,16 @@ this file describes the result.
                                 │ list of Flow.id integers
                                 ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  api/task_queue.py  —  RQ enqueue                                     │
+│  api/task_queue.py  —  ThreadPoolExecutor                             │
 │                                                                       │
-│  Flow IDs are chunked: ADNS_RQ_BATCH_SIZE per job (default 100).      │
-│  A batch of 50 flows from one POST /ingest produces one job.          │
-│  Queue name: ADNS_RQ_QUEUE  (default "flow_scores")                   │
-│  Job timeout: ADNS_RQ_JOB_TIMEOUT  (default 120 s)                   │
+│  Flow IDs are chunked: ADNS_SCORING_BATCH_SIZE per chunk (default     │
+│  100).  A batch of 50 flows from one POST /ingest produces one        │
+│  submitted Future.                                                    │
+│  Worker threads: ADNS_SCORER_WORKERS  (default 2)                    │
 │                                                                       │
-│  Each job payload: tasks.score_flow_batch(chunk_of_ids)               │
+│  Each Future calls: tasks.score_flow_batch(chunk_of_ids)              │
 └───────────────────────────────┬───────────────────────────────────────┘
-                                │ job queued in Redis
-                                ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│  api/worker.py  —  RQ worker                                          │
-│                                                                       │
-│  Polls Redis for jobs.  RQ default poll interval: 1 s.               │
-│  Worker count is deployment-specific (Docker Compose runs one).       │
-└───────────────────────────────┬───────────────────────────────────────┘
-                                │ dequeues job → calls score_flow_batch()
+                                │ background thread → calls score_flow_batch()
                                 ▼
 ┌───────────────────────────────────────────────────────────────────────┐
 │  api/tasks.py  —  score_flow_batch(flow_ids)                          │
@@ -132,7 +122,7 @@ this file describes the result.
 ## Simulation path (bypass)
 
 `POST /simulate` is synchronous and does **not** use the capture agent, the
-ingest endpoint, or the RQ queue.  It generates synthetic Flow objects in
+ingest endpoint, or the background thread pool.  It generates synthetic Flow objects in
 memory, scores them immediately via `simulation_detector.predict()`, inserts
 Flow + Prediction rows in one transaction, and returns.  The flows are visible
 on the next dashboard poll (~0–2 s later).
@@ -154,8 +144,8 @@ accumulates at each step before it is visible on the dashboard.
 | Capture buffer | ~0 ms | ~1 000 ms | 2 000 ms | `POST_INTERVAL` (2.0 s) |
 | HTTP POST to /ingest | <5 ms | <20 ms | 5 000 ms | agent HTTP timeout |
 | DB flush + commit | <5 ms | <20 ms | ~100 ms | Postgres latency |
-| RQ enqueue (Redis) | <2 ms | <5 ms | ~50 ms | Redis round-trip |
-| Worker pickup | <10 ms | ~500 ms | 1 000 ms | RQ poll interval (1 s) |
+| Thread pool submit | <1 ms | <1 ms | ~5 ms | in-process (no round-trip) |
+| Thread pool pickup | <1 ms | ~1–10 ms | ~50 ms | depends on worker load |
 | rDNS lookup (cache miss) | 0 ms | 0–500 ms | 500 ms × N flows | `ADNS_RDNS_TIMEOUT_MS` |
 | Model inference | <1 ms | <10 ms | ~50 ms | model tier in use |
 | DB prediction write | <5 ms | <10 ms | ~50 ms | Postgres latency |
@@ -170,7 +160,7 @@ accumulates at each step before it is visible on the dashboard.
 | Level | Batch size | Variable | Where enforced |
 |---|---|---|---|
 | Capture → /ingest | 50 flows | `BATCH_SIZE` | `agent/capture.py:34` |
-| /ingest → RQ job | 100 flow IDs per job | `ADNS_RQ_BATCH_SIZE` | `api/task_queue.py:43` |
+| /ingest → thread pool | 100 flow IDs per Future | `ADNS_SCORING_BATCH_SIZE` | `api/task_queue.py` |
 | Worker DB fetch | 256 rows per SELECT | `ADNS_SCORING_FETCH_CHUNK` | `api/tasks.py:18` |
 | Retention delete | 1 000 rows per DELETE | hardcoded | `api/app.py:664` |
 | Dashboard /flows | 400 flows returned | `MAX_FLOWS` | `api/app.py:30` |
@@ -187,10 +177,8 @@ accumulates at each step before it is visible on the dashboard.
 | `POST_INTERVAL` | 2.0 s | Capture |
 | `RETRY_DELAY` | 3.0 s | Capture |
 | `API_URL` | http://127.0.0.1:5000/ingest | Capture |
-| `ADNS_REDIS_URL` | redis://127.0.0.1:6379/0 | Queue + Worker |
-| `ADNS_RQ_QUEUE` | flow_scores | Queue + Worker |
-| `ADNS_RQ_BATCH_SIZE` | 100 | Queue |
-| `ADNS_RQ_JOB_TIMEOUT` | 120 s | Queue |
+| `ADNS_SCORER_WORKERS` | 2 | Thread pool |
+| `ADNS_SCORING_BATCH_SIZE` | 100 | Thread pool |
 | `ADNS_SCORING_FETCH_CHUNK` | 256 | Scoring |
 | `ADNS_RDNS_ENABLED` | true | Scoring |
 | `ADNS_RDNS_TIMEOUT_MS` | 500 | Scoring |
@@ -201,14 +189,14 @@ accumulates at each step before it is visible on the dashboard.
 | `ADNS_FLOW_RETENTION_MINUTES` | 30 | Ingest |
 | `ADNS_FLOW_RETENTION_MAX_ROWS` | 5 000 | Ingest |
 | `ADNS_ADMIN_TOKEN` | *(unset)* | block_ip / unblock_ip (killswitch is not gated) |
-| `SQLALCHEMY_DATABASE_URI` | postgresql://adns:adns_password@127.0.0.1/adns | API + Worker |
+| `SQLALCHEMY_DATABASE_URI` | postgresql://adns:adns_password@127.0.0.1/adns | API |
 
 ---
 
 ## Related documents
 
 - [ADR 0001](0001-microservice-architecture.md) — why the pipeline is split across services
-- [ADR 0002](0002-async-scoring-redis-rq.md) — why scoring is async and the inline fallback
+- [ADR 0002](0002-async-scoring-redis-rq.md) — why scoring is async; Redis/RQ → ThreadPoolExecutor migration
 - [ADR 0003](0003-three-tier-detection-cascade.md) — the detection cascade and hot reload
 - [ADR 0004](0004-postgres-persistence-and-retention.md) — persistence and retention policy
 - [ADR 0005](0005-feature-synthesis-for-sparse-telemetry.md) — feature engineering for live telemetry

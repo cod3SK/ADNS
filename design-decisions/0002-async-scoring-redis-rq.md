@@ -1,6 +1,6 @@
-# 0002 — Asynchronous scoring with Redis/RQ and an inline fallback
+# 0002 — Asynchronous scoring with an in-process thread pool
 
-- **Status:** Accepted
+- **Status:** Accepted (amended — see below)
 - **Phase:** 0 — Foundational architecture
 
 ## Context
@@ -39,3 +39,26 @@ Batch size, fetch chunk size, queue name, and job timeout are all environment-dr
 - Cost: two code paths reach the scorer (worker and inline), so scoring must be
   free of request-context assumptions. `score_flow_batch` runs inside an explicit
   app context to satisfy this.
+
+## Amendment — replaced with in-process thread pool
+
+Redis/RQ introduced an external service dependency that prevented the stack from
+running natively on Windows (no official Redis for Windows) and added operational
+complexity for local development. The system is now refactored to target Windows
+as its primary platform.
+
+**New approach:** `task_queue.enqueue_flow_scoring` submits chunks to a
+`concurrent.futures.ThreadPoolExecutor` (default 2 workers, tunable via
+`ADNS_SCORER_WORKERS`). The public interface — `enqueue_flow_scoring(flow_ids)`
+— is unchanged, so the rest of the codebase is unaffected. `score_flow_batch` in
+`tasks.py` still wraps itself in an explicit Flask app context, making it safe
+to call from background threads.
+
+**What was removed:** `api/worker.py` (RQ bootstrap), `redis` and `rq` from
+`requirements.txt`, the `redis` and `worker` services from `docker-compose.yml`,
+and the two-level inline fallback in `/ingest`.
+
+**Trade-off accepted:** scoring jobs are in-process and do not survive a process
+restart (unlike RQ jobs which live in Redis). For this project's scale this is
+acceptable. A production deployment requiring durability could reintroduce a queue
+without changing `tasks.py` or the `/ingest` endpoint.

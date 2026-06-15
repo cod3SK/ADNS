@@ -807,13 +807,7 @@ def ingest():
         try:
             enqueued = enqueue_flow_scoring(flow_ids)
         except Exception as exc:  # pragma: no cover
-            app.logger.exception("failed to enqueue flows for scoring: %s", exc)
-            try:
-                from tasks import score_flow_batch  # type: ignore
-
-                score_flow_batch(flow_ids)
-            except Exception:
-                app.logger.exception("inline scoring fallback also failed")
+            app.logger.exception("failed to submit flows for background scoring: %s", exc)
 
     return jsonify(
         {"status": "ok", "ingested": created, "blocked": blocked, "purged": purged, "queued": enqueued}

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/OffensiveGeneric/ADNS/actions/workflows/ci.yml/badge.svg)](https://github.com/OffensiveGeneric/ADNS/actions/workflows/ci.yml)
 
-ADNS is an end-to-end demo of a modern network anomaly detection platform. It ingests live packet captures, stores recent flows in PostgreSQL, pushes scoring jobs over Redis/RQ to a DetectionEngine (meta ensemble → sklearn → heuristics), and visualizes detections on a React dashboard. Attack scenarios are driven from the CLI tool in `core/attack_generator.py`, not the dashboard.
+ADNS is an end-to-end demo of a modern network anomaly detection platform. It ingests live packet captures, stores recent flows in PostgreSQL, scores them asynchronously via an in-process thread pool with a DetectionEngine (meta ensemble → sklearn → heuristics), and visualizes detections on a React dashboard. Attack scenarios are driven from the CLI tool in `core/attack_generator.py`, not the dashboard.
 
 ## Architecture
 <img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/3c972f97-f751-4c92-9d10-fb54f326c4b3" />
@@ -11,9 +11,8 @@ ADNS is an end-to-end demo of a modern network anomaly detection platform. It in
 | Component | Path | Description |
 | --- | --- | --- |
 | Packet capture agent | `agent/` | `capture.py` wraps `tshark`, normalizes packet metadata into flow JSON, and POSTs batches to `/api/ingest`. |
-| Flask API | `api/` | Persists flows/predictions, exposes `/flows`, `/anomalies`, `/simulate`, and enqueues new flow IDs on Redis/RQ. |
-| Redis task queue | `api/task_queue.py`, `api/tasks.py` | RQ helpers that push flow IDs to `flow_scores` and score them inside app context. |
-| Scoring worker | `api/worker.py` | RQ worker bootstrap; consumes `flow_scores` jobs and drives the DetectionEngine. |
+| Flask API | `api/` | Persists flows/predictions, exposes `/flows`, `/anomalies`, `/simulate`, and submits flow IDs to an in-process thread pool for scoring. |
+| Thread pool scorer | `api/task_queue.py`, `api/tasks.py` | `ThreadPoolExecutor` that runs `score_flow_batch` in background threads inside app context. |
 | Frontend dashboard | `frontend/adns-frontend/` | Vite/React UI with anomaly charts and severity donut. |
 | ML lab | `ml/` | Preprocessing scripts (`preprocess/`), meta-model notebooks, and `train_flow_detector.py` for the live scorer. |
 | Model artifacts | `api/model_artifacts/` | `meta_model_combined.joblib` (ExtraTrees+XGBoost) + `flow_detector.joblib` (sklearn pipeline). |
@@ -28,7 +27,7 @@ The significant design choices are recorded as [Architecture Decision Records](d
 (ADRs). In brief:
 
 - **[Microservice architecture](design-decisions/0001-microservice-architecture.md)** — capture, API, worker, and UI are split so the privileged Linux-only agent never blocks running the rest of the stack, and each service carries only its own dependencies.
-- **[Async scoring with Redis/RQ + inline fallback](design-decisions/0002-async-scoring-redis-rq.md)** — ingestion enqueues scoring and returns fast, but degrades to inline scoring when Redis is down so the demo always works.
+- **[Async scoring with in-process thread pool](design-decisions/0002-async-scoring-redis-rq.md)** — ingestion submits flow IDs to a `ThreadPoolExecutor` and returns immediately; no external queue dependency.
 - **[Three-tier detection cascade](design-decisions/0003-three-tier-detection-cascade.md)** — meta ensemble → calibrated sklearn → rule-based heuristic, with hot model reload; the system always produces a score regardless of what is installed.
 - **[Persistence, in-code schema management, and retention](design-decisions/0004-postgres-persistence-and-retention.md)** — PostgreSQL (SQLite-substitutable), self-healing schema migrations on startup, and automatic pruning to stay bounded.
 - **[Feature synthesis for sparse telemetry](design-decisions/0005-feature-synthesis-for-sparse-telemetry.md)** — live `tshark` data is estimated/hashed into the model's full feature vector; documents the resulting train/serve skew honestly.
@@ -74,7 +73,7 @@ Prereqs: Docker + Docker Compose, Git.
 ```bash
 git clone https://github.com/OffensiveGeneric/ADNS.git
 cd ADNS
-docker compose up --build -d          # API:5000, Frontend:8080, Postgres, Redis, worker
+docker compose up --build -d          # API:5000, Frontend:8080, Postgres
 ```
 
 - Frontend: `http://localhost:8080`
@@ -86,7 +85,7 @@ docker compose up --build -d          # API:5000, Frontend:8080, Postgres, Redis
 
 ### Local dev (bare metal, optional)
 If you prefer running services directly:
-- macOS/Linux: `./scripts/setup_local.sh` then start API/worker/agent/frontend with the commands in `AGENTS.md`.
+- macOS/Linux: `./scripts/setup_local.sh` then start API/agent/frontend with the commands in `AGENTS.md`.
 - Windows: `pwsh ./scripts/setup_local.ps1` then use the PowerShell commands in `AGENTS.md`.
 
 Databases:
@@ -94,18 +93,17 @@ Databases:
 - SQLite (no install): set `SQLALCHEMY_DATABASE_URI=sqlite:///./adns.db` in `.env`
 
 ## Docker Compose (dev stack)
-- Build and run API, worker, frontend, Postgres, and Redis: `docker compose up --build` (from repo root). API on `http://localhost:5000`, frontend on `http://localhost:8080`.
+- Build and run API, frontend, and Postgres: `docker compose up --build` (from repo root). API on `http://localhost:5000`, frontend on `http://localhost:8080`.
 - Frontend build arg: override `VITE_API_URL` if you want a different API origin (default `http://localhost:5000`); e.g., `docker compose build --build-arg VITE_API_URL=http://api:5000 frontend`.
 - Optional capture agent: `docker compose --profile agent up --build agent` (Linux only, uses `network_mode: host` and `NET_ADMIN` so `tshark` can see host traffic). On macOS/Windows, run the agent on the host instead and point `API_URL` at `http://localhost:5000/ingest`.
 - Persistent Postgres data lives in the `pgdata` volume; remove it with `docker volume rm adns_pgdata` if you need a clean slate.
-- Redis runs in-memory; queueing can be disabled by stopping the worker container (API will fall back to inline scoring).
 - Common fixes:
   - macOS AirPlay can own port 5000; if `curl localhost:5000/health` returns 403 AirTunes, change the API port mapping (e.g., `5100:5000`), restart compose, and point agent/frontend at the new port.
   - If the UI cannot reach the API, rebuild the frontend with the right base: `docker compose build --no-cache --build-arg VITE_API_URL=http://127.0.0.1:5000 frontend && docker compose up -d frontend` (or `VITE_API_URL=""` to use the nginx `/api` proxy). Verify with `curl http://localhost:8080/api/health`.
 
 ### Run locally to monitor your own traffic
 
-1) Install system deps: PostgreSQL (or use SQLite via `SQLALCHEMY_DATABASE_URI=sqlite:///./adns.db`), Redis (optional; inline scoring fallback works if Redis is down), `tshark`, Python 3.9+, Node.js 18+.  
+1) Install system deps: PostgreSQL (or use SQLite via `SQLALCHEMY_DATABASE_URI=sqlite:///./adns.db`), `tshark`, Python 3.9+, Node.js 18+.  
 2) Bootstrap the repo: `./scripts/setup_local.sh` on macOS/Linux or `pwsh ./scripts/setup_local.ps1` on Windows (creates `.venv`, installs API+agent deps, runs `npm install`, and copies `.env.example` to `.env` if missing).  
 3) Edit `.env` as needed:
    - Want Postgres? Install it, run `./scripts/setup_postgres_local.sh` (or `pwsh ./scripts/setup_postgres_local.ps1` on Windows) to create the `adns` database/user, then set `SQLALCHEMY_DATABASE_URI` to the printed URL.
@@ -115,7 +113,6 @@ Databases:
    - `ADNS_RDNS_ENABLED` and related knobs to include reverse-DNS resolution as a scoring feature.
 4) Run services (separate terminals):
    - API: `source .venv/bin/activate && export $(grep -v '^#' .env | xargs) && cd api && flask run`
-   - Worker (optional if relying on inline scoring): `source .venv/bin/activate && export $(grep -v '^#' .env | xargs) && python api/worker.py`
    - Agent (needs tshark + capture privileges): `source .venv/bin/activate && export $(grep -v '^#' .env | xargs) && cd agent && sudo ./capture.py`
    - Frontend: `cd frontend/adns-frontend && export $(grep -v '^#' ../../.env | xargs) && npm run dev -- --host`
    - On Windows/PowerShell: use `.\.venv\Scripts\Activate.ps1` instead of `source ...`, drop `sudo`, and run the agent from an elevated shell so `tshark` can capture.
@@ -124,8 +121,7 @@ Databases:
 
 ### 0. Dependencies
 
-- PostgreSQL (default URL `postgresql://adns:adns_password@127.0.0.1/adns`)
-- Redis (default URL `redis://127.0.0.1:6379/0`) for the RQ job queue
+- PostgreSQL (default URL `postgresql://adns:adns_password@127.0.0.1/adns`) — or SQLite via `SQLALCHEMY_DATABASE_URI=sqlite:///./adns.db`
 - `tshark` on any host that runs the capture agent
 
 The commands below assume those services are already running.
@@ -138,7 +134,6 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 export FLASK_APP=app.py
 export SQLALCHEMY_DATABASE_URI=${SQLALCHEMY_DATABASE_URI:-postgresql://adns:adns_password@127.0.0.1/adns}
-export ADNS_REDIS_URL=${ADNS_REDIS_URL:-redis://127.0.0.1:6379/0}
 flask run
 ```
 
@@ -152,19 +147,7 @@ The API exposes:
 
 On first run `init_db()` creates tables and adds the `flows.extra` JSON column so the agent’s rich metadata can be stored immediately.
 
-### 2. Worker
-
-```bash
-source api/.venv/bin/activate
-export FLASK_APP=app.py
-export SQLALCHEMY_DATABASE_URI=${SQLALCHEMY_DATABASE_URI:-postgresql://adns:adns_password@127.0.0.1/adns}
-export ADNS_REDIS_URL=${ADNS_REDIS_URL:-redis://127.0.0.1:6379/0}
-python api/worker.py        # or use systemd unit adns-worker.service
-```
-
-This boots an RQ worker that listens on `flow_scores`, loads the DetectionEngine (meta ensemble → sklearn → heuristics), and writes `Prediction` rows for each flow ID it dequeues.
-
-### 3. Packet capture agent
+### 2. Packet capture agent
 
 ```bash
 cd agent
@@ -176,7 +159,7 @@ sudo ./capture.py                 # needs privileges for the interface
 
 The agent wraps `tshark`, infers services, batches ~50 flows or 2 seconds, and POSTs them to the API. Production deployments run it under `systemd` (`adns-agent.service`) so it survives reboots.
 
-### 4. Frontend
+### 3. Frontend
 
 ```bash
 cd frontend/adns-frontend
@@ -187,7 +170,7 @@ npm run build && npm run preview   # for production bundle
 
 Building places static assets under `dist/`. Set `VITE_API_URL` before `npm run build` if the UI is hosted separately; the production droplet serves that folder via Nginx at `http://159.203.105.167/`.
 
-### 5. Training & Data Pipelines
+### 4. Training & Data Pipelines
 
 ```bash
 cd ml
@@ -209,7 +192,7 @@ python train_flow_detector.py \
   --model_out ../api/model_artifacts/flow_detector.joblib
 ```
 
-Copy the resulting artifacts (both `flow_detector.joblib` and `meta_model_combined.joblib`) into `/var/www/adns/api/model_artifacts/` (or wherever Gunicorn/RQ runs) and restart `adns-worker` so the DetectionEngine reloads them.
+Copy the resulting artifacts (both `flow_detector.joblib` and `meta_model_combined.joblib`) into `/var/www/adns/api/model_artifacts/` (or wherever Gunicorn runs) and restart the API so the DetectionEngine reloads them.
 
 ## Demo Tips
 
@@ -237,7 +220,7 @@ curl -X POST http://localhost:5000/ingest -H 'Content-Type: application/json' \
 ## Testing
 
 The API ships with a `pytest` suite that runs against a throwaway SQLite database
-in heuristic scoring mode — no PostgreSQL, Redis, or ML artifacts required:
+in heuristic scoring mode — no PostgreSQL or ML artifacts required:
 
 ```bash
 cd api
