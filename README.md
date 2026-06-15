@@ -257,6 +257,15 @@ lint/build on every push and pull request.
   Linux, or `netsh advfirewall` block-all rules on Windows, preserving localhost
   so the monitoring stack stays reachable. Requires `NET_ADMIN` (Linux) or an
   Administrator process (Windows).
+  **Deployment constraint:** the killswitch only affects the machine the API
+  process runs on directly. When the API runs inside Docker on Windows, `sys.platform`
+  is `linux` (container OS), so the `netsh` Windows path is never taken; the
+  iptables path applies rules inside the container's own network namespace, not
+  on the Windows host. Docker Desktop on Windows also uses a WSL2 Linux VM as its
+  host layer, so even escaping the container via `nsenter` would only reach the VM,
+  not the Windows machine's actual network adapters. The killswitch works as
+  intended on a **native Linux deployment** where the API runs directly on the
+  host.
 - **Block/unblock IP** (`/block_ip`, `/unblock_ip`) require `ADNS_ADMIN_TOKEN` to
   be set **and** the caller to send a matching `Authorization: Bearer <token>` (or
   `X-Admin-Token: <token>`). Without a token those endpoints return HTTP 403 —

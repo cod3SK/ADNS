@@ -57,3 +57,13 @@ Additionally, the killswitch scope was expanded from a single configured interfa
 (`ADNS_KILLSWITCH_INTERFACE`, default `eth0`) to **all non-loopback interfaces**
 (`iptables ! -o lo` / `! -i lo` on Linux; `netsh advfirewall` block-all rules on
 Windows), so it actually cuts all external traffic rather than one NIC.
+
+**Docker on Windows limitation:** when the API runs inside a Docker container on
+Windows Desktop, the killswitch cannot affect the Windows host's network.
+`sys.platform` inside the container is `linux`, so the `netsh` Windows path is
+never reached. The iptables path applies rules in the container's own network
+namespace. Even with `NET_ADMIN`/`SYS_ADMIN` capabilities and `nsenter` available,
+Docker Desktop routes containers through a WSL2 Linux VM — escaping the container
+would only reach that VM, not the Windows machine's actual network adapters. The
+killswitch is effective on a **native Linux deployment** where the API runs
+directly on the host.
