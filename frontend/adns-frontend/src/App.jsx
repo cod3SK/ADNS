@@ -132,11 +132,21 @@ export default function App() {
     setKillBusy(true);
     try {
       const next = !killSwitch;
-      await api.post("/api/killswitch", { enabled: next });
-      setKillSwitch(next);
+      const res = await api.post("/api/killswitch", { enabled: next });
+      if (res.data?.os_action === "failed") {
+        setError(
+          next
+            ? "Killswitch: firewall rules could not be applied. On Windows, run the API as Administrator. On Linux, ensure NET_ADMIN capability."
+            : "Killswitch: firewall rules could not be removed."
+        );
+        // button stays in previous state — OS rules were not applied
+      } else {
+        setKillSwitch(next);
+        setError("");
+      }
     } catch (err) {
       console.error("killswitch toggle failed", err);
-      setError("Unable to toggle killswitch");
+      setError("Unable to reach the API to toggle killswitch.");
     } finally {
       setKillBusy(false);
     }

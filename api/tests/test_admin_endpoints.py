@@ -28,11 +28,24 @@ def test_unblock_ip_works_without_token(client, monkeypatch):
 
 
 def test_killswitch_post_works_without_token(client, monkeypatch):
-    monkeypatch.setattr(app_module, "ensure_killswitch_rules_enabled", lambda enabled: None)
+    monkeypatch.setattr(app_module, "ensure_killswitch_rules_enabled", lambda enabled: True)
     monkeypatch.setitem(app_module.KILL_SWITCH_STATE, "enabled", False)
     resp = client.post("/killswitch", json={"enabled": True})
     assert resp.status_code == 200
-    assert resp.get_json() == {"enabled": True}
+    body = resp.get_json()
+    assert body["enabled"] is True
+    assert body["os_action"] == "ok"
+
+
+def test_killswitch_post_reports_os_failure(client, monkeypatch):
+    monkeypatch.setattr(app_module, "ensure_killswitch_rules_enabled", lambda enabled: False)
+    monkeypatch.setitem(app_module.KILL_SWITCH_STATE, "enabled", False)
+    resp = client.post("/killswitch", json={"enabled": True})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["os_action"] == "failed"
+    # state must not have changed — rules were not applied
+    assert body["enabled"] is False
 
 
 def test_killswitch_get_is_open(client):

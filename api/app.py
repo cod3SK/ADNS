@@ -248,30 +248,38 @@ _KILLSWITCH_IPTABLES = [
 ]
 
 
-def _ensure_killswitch_windows(enabled: bool) -> None:
+def _ensure_killswitch_windows(enabled: bool) -> bool:
+    ok = True
     for rule_name, direction in ((_KILLSWITCH_RULE_IN, "in"), (_KILLSWITCH_RULE_OUT, "out")):
         exists, _ = _run_cmd(["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"])
         if enabled and not exists:
-            _run_cmd([
+            success, _ = _run_cmd([
                 "netsh", "advfirewall", "firewall", "add", "rule",
                 f"name={rule_name}", f"dir={direction}",
                 "action=block", "profile=any",
             ])
+            ok = ok and success
         elif not enabled and exists:
-            _run_cmd(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"])
+            success, _ = _run_cmd(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"])
+            ok = ok and success
+    return ok
 
 
-def ensure_killswitch_rules_enabled(enabled: bool) -> None:
-    """Drop all non-loopback traffic. Best effort; requires NET_ADMIN (Linux) or Administrator (Windows)."""
+def ensure_killswitch_rules_enabled(enabled: bool) -> bool:
+    """Drop all non-loopback traffic. Returns True if all OS rules applied successfully.
+    Requires NET_ADMIN (Linux) or an Administrator process (Windows)."""
     if sys.platform == "win32":
-        _ensure_killswitch_windows(enabled)
-        return
+        return _ensure_killswitch_windows(enabled)
+    ok = True
     for check_cmd, add_cmd, remove_cmd in _KILLSWITCH_IPTABLES:
         exists, _ = _run_cmd(check_cmd)
         if enabled and not exists:
-            _run_cmd(add_cmd)
+            success, _ = _run_cmd(add_cmd)
+            ok = ok and success
         elif not enabled and exists:
-            _run_cmd(remove_cmd)
+            success, _ = _run_cmd(remove_cmd)
+            ok = ok and success
+    return ok
 
 
 def _block_ip_windows(ip: str, allow: bool) -> tuple[bool, str]:
@@ -1114,9 +1122,13 @@ def killswitch():
     if request.method == "POST":
         payload = request.get_json(silent=True) or {}
         enabled = bool(payload.get("enabled"))
-        KILL_SWITCH_STATE["enabled"] = enabled
-        ensure_killswitch_rules_enabled(enabled)
-        return jsonify({"enabled": enabled})
+        os_ok = ensure_killswitch_rules_enabled(enabled)
+        if os_ok:
+            KILL_SWITCH_STATE["enabled"] = enabled
+        return jsonify({
+            "enabled": bool(KILL_SWITCH_STATE.get("enabled", False)),
+            "os_action": "ok" if os_ok else "failed",
+        })
     return jsonify({"enabled": bool(KILL_SWITCH_STATE.get("enabled", False))})
 
 
