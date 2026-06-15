@@ -2,7 +2,7 @@
 
 Block/unblock always update the DB (no token required); iptables is only
 attempted when a valid admin token is present (so it works in environments
-where iptables is available). The killswitch POST remains fully token-gated.
+where iptables is available). The killswitch POST is not token-gated.
 """
 
 import app as app_module
@@ -27,9 +27,12 @@ def test_unblock_ip_works_without_token(client, monkeypatch):
     assert resp.get_json()["status"] == "unblocked"
 
 
-def test_killswitch_post_disabled_without_token(client):
+def test_killswitch_post_works_without_token(client, monkeypatch):
+    monkeypatch.setattr(app_module, "ensure_killswitch_rules_enabled", lambda enabled: None)
+    monkeypatch.setitem(app_module.KILL_SWITCH_STATE, "enabled", False)
     resp = client.post("/killswitch", json={"enabled": True})
-    assert resp.status_code == 403
+    assert resp.status_code == 200
+    assert resp.get_json() == {"enabled": True}
 
 
 def test_killswitch_get_is_open(client):
