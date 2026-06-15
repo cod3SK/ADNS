@@ -33,7 +33,7 @@ The significant design choices are recorded as [Architecture Decision Records](d
 - **[Persistence, in-code schema management, and retention](design-decisions/0004-postgres-persistence-and-retention.md)** — PostgreSQL (SQLite-substitutable), self-healing schema migrations on startup, and automatic pruning to stay bounded.
 - **[Feature synthesis for sparse telemetry](design-decisions/0005-feature-synthesis-for-sparse-telemetry.md)** — live `tshark` data is estimated/hashed into the model's full feature vector; documents the resulting train/serve skew honestly.
 - **[Attack simulation subsystem](design-decisions/0006-attack-simulation-subsystem.md)** — `POST /simulate` drives believable threat scenarios through the real scoring path for demos.
-- **[Fail-closed admin-token gate](design-decisions/0007-admin-token-gate-for-response-actions.md)** — the `iptables` response endpoints are disabled unless `ADNS_ADMIN_TOKEN` is set, then require a bearer/header token.
+- **[Fail-closed admin-token gate](design-decisions/0007-admin-token-gate-for-response-actions.md)** — `/block_ip` and `/unblock_ip` are disabled unless `ADNS_ADMIN_TOKEN` is set, then require a bearer/header token. `/killswitch` is ungated so it works immediately from the dashboard.
 - **[Externalized configuration and secrets](design-decisions/0008-externalized-configuration-and-secrets.md)** — credentials come from the environment with demo-only defaults; no real secret lives in source.
 - **[Test strategy and CI](design-decisions/0009-test-strategy-and-ci.md)** — tests run against the heuristic + SQLite paths, so the full suite is fast, dependency-light, and runs in CI on every push.
 
@@ -251,13 +251,16 @@ lint/build on every push and pull request.
 
 ## Security notes
 
-- The network-response endpoints (`/block_ip`, `/unblock_ip`, `/killswitch`) always
-  record block/unblock actions in the database. The OS-level firewall step
-  (`iptables` on Linux, `netsh advfirewall` on Windows) only runs when
-  `ADNS_ADMIN_TOKEN` is set **and** the caller sends a matching
-  `Authorization: Bearer <token>` (or `X-Admin-Token: <token>`). Without a token
-  the DB is still updated but no firewall rules are touched — fail-safe, not
-  fail-closed, by design.
+- **Killswitch** (`POST /killswitch`) is intentionally ungated — it is a
+  first-responder action that must work from the dashboard without configuration.
+  When triggered it drops all non-loopback traffic via `iptables ! -o/-i lo` on
+  Linux, or `netsh advfirewall` block-all rules on Windows, preserving localhost
+  so the monitoring stack stays reachable. Requires `NET_ADMIN` (Linux) or an
+  Administrator process (Windows).
+- **Block/unblock IP** (`/block_ip`, `/unblock_ip`) require `ADNS_ADMIN_TOKEN` to
+  be set **and** the caller to send a matching `Authorization: Bearer <token>` (or
+  `X-Admin-Token: <token>`). Without a token those endpoints return HTTP 403 —
+  fail closed by default.
 - Database credentials are read from the environment (`POSTGRES_USER`,
   `POSTGRES_PASSWORD`, `POSTGRES_DB`). The committed defaults are for local demos
   only — set real values in `.env` before any non-local deployment.
