@@ -31,11 +31,12 @@ MAX_FLOWS = 400  # keep last N flows when responding to dashboard clients
 FLOW_RETENTION_MINUTES = int(os.environ.get("ADNS_FLOW_RETENTION_MINUTES", "30"))
 FLOW_RETENTION_MAX_ROWS = int(os.environ.get("ADNS_FLOW_RETENTION_MAX_ROWS", "5000"))
 KILL_SWITCH_STATE = {"enabled": False}
-KILL_SWITCH_INTERFACE = os.environ.get("ADNS_KILLSWITCH_INTERFACE", "eth0")
 USE_NSENTER = os.environ.get("ADNS_NSENTER_HOST", "true").lower() not in {"0", "false", "no"}
-# Network-response endpoints (block/unblock/killswitch) shell out to iptables
-# on the host namespace, so they are gated behind a shared admin token. When the
-# token is unset the endpoints stay disabled — fail closed rather than open.
+# block_ip / unblock_ip shell out to iptables on the host namespace and are
+# gated behind a shared admin token. When the token is unset those endpoints
+# stay disabled — fail closed rather than open.
+# The killswitch is not token-gated: it is a first-responder dashboard action
+# and must work without extra configuration.
 ADMIN_TOKEN = os.environ.get("ADNS_ADMIN_TOKEN", "").strip()
 
 # Prevents multiple concurrent streaming threads from accumulating (OOM risk)
@@ -229,31 +230,48 @@ def _run_cmd(cmd: list[str]) -> tuple[bool, str]:
         return False, stderr or "command failed"
 
 
-def ensure_killswitch_rules_enabled(enabled: bool) -> None:
-    """
-    Toggle iptables DROP rules on the configured interface. Best effort;
-    requires NET_ADMIN on the host/namespace where this runs.
-    """
-    iface = KILL_SWITCH_INTERFACE
-    rules = [
-        ["iptables", "-C", "OUTPUT", "-o", iface, "-j", "DROP"],
-        ["iptables", "-C", "INPUT", "-i", iface, "-j", "DROP"],
-    ]
-    existing = []
-    for rule in rules:
-        ok, _ = _run_cmd(rule)
-        existing.append(ok)
+_KILLSWITCH_RULE_IN = "ADNS Killswitch IN"
+_KILLSWITCH_RULE_OUT = "ADNS Killswitch OUT"
 
-    if enabled:
-        if not existing[0]:
-            _run_cmd(["iptables", "-I", "OUTPUT", "-o", iface, "-j", "DROP"])
-        if not existing[1]:
-            _run_cmd(["iptables", "-I", "INPUT", "-i", iface, "-j", "DROP"])
-    else:
-        if existing[0]:
-            _run_cmd(["iptables", "-D", "OUTPUT", "-o", iface, "-j", "DROP"])
-        if existing[1]:
-            _run_cmd(["iptables", "-D", "INPUT", "-i", iface, "-j", "DROP"])
+# Blocks all non-loopback traffic so the monitoring stack stays reachable over localhost.
+_KILLSWITCH_IPTABLES = [
+    (
+        ["iptables", "-C", "OUTPUT", "!", "-o", "lo", "-j", "DROP"],
+        ["iptables", "-I", "OUTPUT", "!", "-o", "lo", "-j", "DROP"],
+        ["iptables", "-D", "OUTPUT", "!", "-o", "lo", "-j", "DROP"],
+    ),
+    (
+        ["iptables", "-C", "INPUT", "!", "-i", "lo", "-j", "DROP"],
+        ["iptables", "-I", "INPUT", "!", "-i", "lo", "-j", "DROP"],
+        ["iptables", "-D", "INPUT", "!", "-i", "lo", "-j", "DROP"],
+    ),
+]
+
+
+def _ensure_killswitch_windows(enabled: bool) -> None:
+    for rule_name, direction in ((_KILLSWITCH_RULE_IN, "in"), (_KILLSWITCH_RULE_OUT, "out")):
+        exists, _ = _run_cmd(["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"])
+        if enabled and not exists:
+            _run_cmd([
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                f"name={rule_name}", f"dir={direction}",
+                "action=block", "profile=any",
+            ])
+        elif not enabled and exists:
+            _run_cmd(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"])
+
+
+def ensure_killswitch_rules_enabled(enabled: bool) -> None:
+    """Drop all non-loopback traffic. Best effort; requires NET_ADMIN (Linux) or Administrator (Windows)."""
+    if sys.platform == "win32":
+        _ensure_killswitch_windows(enabled)
+        return
+    for check_cmd, add_cmd, remove_cmd in _KILLSWITCH_IPTABLES:
+        exists, _ = _run_cmd(check_cmd)
+        if enabled and not exists:
+            _run_cmd(add_cmd)
+        elif not enabled and exists:
+            _run_cmd(remove_cmd)
 
 
 def _block_ip_windows(ip: str, allow: bool) -> tuple[bool, str]:
@@ -1094,11 +1112,6 @@ def unblock_ip():
 @app.route("/killswitch", methods=["GET", "POST"])
 def killswitch():
     if request.method == "POST":
-        # Mutating the kill switch shells out to iptables; gate it on the token.
-        # Reading the current state (GET) is harmless and stays open.
-        guard = _require_admin_token_now()
-        if guard is not None:
-            return guard
         payload = request.get_json(silent=True) or {}
         enabled = bool(payload.get("enabled"))
         KILL_SWITCH_STATE["enabled"] = enabled

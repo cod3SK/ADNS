@@ -9,6 +9,12 @@ Each ADR follows the same shape: **Context** (the forces at play), **Decision**
 (what we chose), **Consequences** (the trade-offs we accepted), and where useful
 **Alternatives considered**.
 
+## Start here
+
+**[architecture.md](architecture.md)** — full pipeline map: every component,
+call direction, batch size, timing bound, and tuning variable in one place.
+Read this first; the ADRs below explain the *why* behind individual decisions.
+
 ## Index
 
 ### Phase 0 — Foundational architecture
