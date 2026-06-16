@@ -8,12 +8,15 @@ the React build (which uses /api/* paths via the Vite proxy convention)
 works against Flask's routes without any route changes.
 """
 
+import ctypes
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
 import urllib.request
+import winreg
 
 
 def resource_path(relative: str) -> str:
@@ -85,7 +88,6 @@ def _wait_for_api(url: str, timeout: float = 15.0) -> bool:
 
 def _fatal(msg: str) -> None:
     try:
-        import ctypes
         ctypes.windll.user32.MessageBoxW(0, msg, "ADNS — Startup Error", 0x10)
     except Exception:
         print(msg, file=sys.stderr)
@@ -97,7 +99,61 @@ def _port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _elevate() -> None:
+    params = " ".join(f'"{a}"' for a in sys.argv[1:]) if len(sys.argv) > 1 else ""
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    sys.exit(0)
+
+
+def _npcap_installed() -> bool:
+    for key in (
+        r"SYSTEM\CurrentControlSet\Services\npcap",
+        r"SYSTEM\CurrentControlSet\Services\npf",
+    ):
+        try:
+            winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _ensure_npcap() -> None:
+    if _npcap_installed():
+        return
+    installer = resource_path("npcap-installer.exe")
+    if os.path.isfile(installer):
+        ok = ctypes.windll.user32.MessageBoxW(
+            0,
+            "ADNS requires Npcap for network packet capture.\n\nClick OK to install it now.",
+            "ADNS — Npcap Required",
+            0x01,
+        )
+        if ok == 1:
+            subprocess.run([installer, "/S"], check=True, timeout=120)
+        else:
+            sys.exit(0)
+    else:
+        _fatal(
+            "Npcap is required for network packet capture but is not installed.\n\n"
+            "Download and install Npcap from https://npcap.com, then restart ADNS."
+        )
+
+
 def main() -> None:
+    if sys.platform == "win32" and not _is_admin():
+        _elevate()
+        return
+
+    _ensure_npcap()
+
     data_dir = _data_dir()
 
     if _port_in_use(5000):

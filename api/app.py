@@ -774,8 +774,11 @@ _TSHARK_SERVICE_PORTS = {
 
 
 def _find_tshark() -> str | None:
-    # Prefer a system Wireshark install — it has Npcap and registry entries set up.
-    # Fall back to the bundled copy only when Wireshark isn't installed on the machine.
+    # Bundled copy is preferred: launcher ensures admin rights + Npcap before we get here.
+    if hasattr(sys, "_MEIPASS"):
+        bundled = os.path.join(sys._MEIPASS, "tshark", "tshark.exe")
+        if os.path.isfile(bundled):
+            return bundled
     for candidate in [
         os.environ.get("TSHARK_BIN", ""),
         r"C:\Program Files\Wireshark\tshark.exe",
@@ -783,11 +786,18 @@ def _find_tshark() -> str | None:
     ]:
         if candidate and os.path.isfile(candidate):
             return candidate
-    if hasattr(sys, "_MEIPASS"):
-        bundled = os.path.join(sys._MEIPASS, "tshark", "tshark.exe")
-        if os.path.isfile(bundled):
-            return bundled
     return None
+
+
+def _tshark_env(tshark_bin: str) -> dict:
+    """Build env + cwd so bundled tshark can find Npcap and its own DLLs."""
+    env = os.environ.copy()
+    tshark_dir = os.path.dirname(os.path.abspath(tshark_bin))
+    # Prepend tshark dir so its bundled DLLs are found first.
+    env["PATH"] = tshark_dir + os.pathsep + env.get("PATH", "")
+    # Wireshark reads this to locate plugins/profiles at runtime.
+    env.setdefault("WIRESHARK_RUN_FROM_BUILD_DIRECTORY", "0")
+    return env
 
 
 def _ts_safe_float(value: str, fallback: float) -> float:
@@ -919,6 +929,8 @@ class _CaptureAgent:
                     stderr=subprocess.DEVNULL,
                     text=True,
                     bufsize=1,
+                    cwd=os.path.dirname(os.path.abspath(tshark_bin)),
+                    env=_tshark_env(tshark_bin),
                 )
             except Exception as exc:
                 self._last_error = str(exc)
@@ -1428,7 +1440,12 @@ def list_interfaces():
     if not tshark:
         return jsonify({"error": "tshark not found", "interfaces": []}), 503
     try:
-        result = subprocess.run([tshark, "-D"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            [tshark, "-D"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.abspath(tshark)),
+            env=_tshark_env(tshark),
+        )
         interfaces = []
         for line in result.stdout.strip().splitlines():
             m = re.match(r"(\d+)\.\s+(\S+)(?:\s+\((.+)\))?", line.strip())

@@ -8,6 +8,12 @@ import os
 
 # Bundle tshark + its DLLs so the app captures traffic without a separate Wireshark install.
 # Npcap (the packet capture driver) must still be installed on the target machine.
+# Bundle npcap installer if present in repo root (download from https://npcap.com).
+_npcap_datas = []
+_npcap_installer = os.path.join(os.path.abspath("."), "npcap-installer.exe")
+if os.path.isfile(_npcap_installer):
+    _npcap_datas.append((_npcap_installer, "."))
+
 _WIRESHARK_DIR = r"C:\Program Files\Wireshark"
 _tshark_datas = []
 if os.path.isdir(_WIRESHARK_DIR):
@@ -36,7 +42,7 @@ a = Analysis(
         ("api/model_artifacts", "model_artifacts"),
         # Flask app source files (all modules in api/)
         ("api/*.py", "api"),
-    ] + sklearn_datas + webview_datas + _tshark_datas,
+    ] + sklearn_datas + webview_datas + _tshark_datas + _npcap_datas,
     hiddenimports=[
         # Flask ecosystem
         "flask_cors",
