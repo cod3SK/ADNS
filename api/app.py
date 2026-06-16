@@ -21,9 +21,21 @@ from task_queue import enqueue_flow_scoring
 app = Flask(__name__)
 CORS(app)
 
-DEFAULT_DB_URI = "postgresql://adns:adns_password@127.0.0.1/adns"
+# Default to a local SQLite file so the app works without PostgreSQL.
+# The launcher (desktop) overrides this with AppData path; production sets the env var.
+_instance_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instance")
+os.makedirs(_instance_dir, exist_ok=True)
+_default_sqlite = "sqlite:///" + os.path.join(_instance_dir, "adns_demo.db").replace("\\", "/")
+DEFAULT_DB_URI = _default_sqlite
+
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("SQLALCHEMY_DATABASE_URI", DEFAULT_DB_URI)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Allow background scorer threads to use the same SQLite connection pool.
+if app.config["SQLALCHEMY_DATABASE_URI"].startswith("sqlite"):
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "connect_args": {"check_same_thread": False},
+    }
 
 db = SQLAlchemy(app)
 
@@ -131,6 +143,9 @@ class BlockedIP(db.Model):
 def init_db() -> None:
     with app.app_context():
         db.create_all()
+        if db.engine.dialect.name == "sqlite":
+            db.session.execute(text("PRAGMA journal_mode=WAL"))
+            db.session.commit()
         ensure_flow_extra_column()
         ensure_prediction_flow_unique_index()
 
