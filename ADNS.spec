@@ -31,9 +31,6 @@ a = Analysis(
         "sqlalchemy.dialects.sqlite.pysqlite",
         "sqlalchemy.pool.impl",
         "sqlalchemy.pool.manage",
-        # Queue (Redis is optional; inline fallback handles the no-Redis path)
-        "rq",
-        "redis",
         # ML stack
         "joblib",
         "numpy",

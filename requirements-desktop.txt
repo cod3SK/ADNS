@@ -8,6 +8,4 @@ numpy
 scikit-learn
 joblib
 xgboost==1.7.6
-redis
-rq
-pywebview
+pywebview>=5.1
