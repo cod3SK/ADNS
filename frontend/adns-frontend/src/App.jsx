@@ -99,7 +99,7 @@ export default function App() {
     try {
       const res = await api.get("/api/agent/status");
       setAgentStatus(res.data);
-    } catch {}
+    } catch { /* silently ignore — status panel degrades gracefully */ }
   }, []);
 
   const fetchInterfaces = useCallback(async () => {
@@ -112,7 +112,7 @@ export default function App() {
         const first = list.find((i) => !i.name.toLowerCase().includes("loopback"));
         return first ? first.device : "";
       });
-    } catch {}
+    } catch { /* silently ignore — dropdown stays empty until next poll */ }
   }, []);
 
   const startCapture = async () => {
