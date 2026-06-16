@@ -1,15 +1,29 @@
+# Python
 __pycache__/
 *.pyc
-.venv/
-.venv-test/
-venv/
-.pytest_cache/
-node_modules/
-build/
+*.pyo
+*.pyd
+*.egg-info/
 .env
-*.env
-*.pem
-data/
-outputs/
-.vs/
-**/.vs/
+venv/
+.venv/
+
+# SQLite dev DB
+api/instance/
+
+# PyInstaller output
+dist/
+build/
+
+# Frontend build
+frontend/adns-frontend/dist/
+frontend/adns-frontend/node_modules/
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
