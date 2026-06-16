@@ -22,6 +22,9 @@ if os.path.isdir(_WIRESHARK_DIR):
     _tshark_exe = os.path.join(_WIRESHARK_DIR, "tshark.exe")
     if os.path.isfile(_tshark_exe):
         _tshark_datas.append((_tshark_exe, "tshark"))
+    _dumpcap_exe = os.path.join(_WIRESHARK_DIR, "dumpcap.exe")
+    if os.path.isfile(_dumpcap_exe):
+        _tshark_datas.append((_dumpcap_exe, "tshark"))
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
