@@ -774,10 +774,8 @@ _TSHARK_SERVICE_PORTS = {
 
 
 def _find_tshark() -> str | None:
-    if hasattr(sys, "_MEIPASS"):
-        bundled = os.path.join(sys._MEIPASS, "tshark", "tshark.exe")
-        if os.path.isfile(bundled):
-            return bundled
+    # Prefer a system Wireshark install — it has Npcap and registry entries set up.
+    # Fall back to the bundled copy only when Wireshark isn't installed on the machine.
     for candidate in [
         os.environ.get("TSHARK_BIN", ""),
         r"C:\Program Files\Wireshark\tshark.exe",
@@ -785,6 +783,10 @@ def _find_tshark() -> str | None:
     ]:
         if candidate and os.path.isfile(candidate):
             return candidate
+    if hasattr(sys, "_MEIPASS"):
+        bundled = os.path.join(sys._MEIPASS, "tshark", "tshark.exe")
+        if os.path.isfile(bundled):
+            return bundled
     return None
 
 
