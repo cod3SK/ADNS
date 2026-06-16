@@ -39,12 +39,21 @@ if ($missing.Count -gt 0) {
 
 # 1. React frontend build
 Write-Host "`n[1/3] Building React frontend..." -ForegroundColor Yellow
-Push-Location "$Root\frontend\adns-frontend"
-npm install
-if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
-npm run build
-if ($LASTEXITCODE -ne 0) { throw "npm run build failed" }
-Pop-Location
+$npmAvailable = $null -ne (Get-Command npm -ErrorAction SilentlyContinue)
+$distExists   = Test-Path "$Root\frontend\adns-frontend\dist\index.html"
+
+if ($npmAvailable) {
+    Push-Location "$Root\frontend\adns-frontend"
+    npm install
+    if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+    npm run build
+    if ($LASTEXITCODE -ne 0) { throw "npm run build failed" }
+    Pop-Location
+} elseif ($distExists) {
+    Write-Host "  npm not found — using existing dist build at frontend/adns-frontend/dist" -ForegroundColor Yellow
+} else {
+    throw "npm is not installed and no pre-built dist found.`nInstall Node.js 18+ (https://nodejs.org) or copy a pre-built dist/ into frontend/adns-frontend/dist."
+}
 
 # 2. PyInstaller
 Write-Host "`n[2/3] Running PyInstaller..." -ForegroundColor Yellow

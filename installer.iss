@@ -54,12 +54,10 @@ AppVersion={#MyAppVersion}
 AppPublisherURL=https://github.com/OffensiveGeneric/ADNS
 AppSupportURL=https://github.com/OffensiveGeneric/ADNS/issues
 UninstallDisplayName=ADNS - Anomaly Detection Network System
-DefaultDirName={localappdata}\ADNS
+DefaultDirName={autopf}\ADNS
 DefaultGroupName=ADNS
-; Install to LocalAppData — no UAC prompt required for the installer itself.
-; The app still self-elevates at runtime (needed for Npcap / raw-socket access).
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; Require admin so the installer can write Npcap and firewall rules.
+PrivilegesRequired=admin
 OutputDir=Output
 OutputBaseFilename=ADNS_installer
 Compression=lzma2/ultra64
@@ -82,13 +80,14 @@ Source: "npcap-installer.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Chec
 
 [Icons]
 ; Desktop shortcut — icon is embedded in ADNS.exe by PyInstaller
-Name: "{userdesktop}\ADNS"; Filename: "{app}\ADNS.exe"; \
+; commondesktop = All Users\Desktop, correct for admin installs
+Name: "{commondesktop}\ADNS"; Filename: "{app}\ADNS.exe"; \
     Comment: "Anomaly Detection Network System"
 
 ; Start Menu
-Name: "{group}\ADNS"; Filename: "{app}\ADNS.exe"; \
+Name: "{commonprograms}\ADNS"; Filename: "{app}\ADNS.exe"; \
     Comment: "Anomaly Detection Network System"
-Name: "{group}\Uninstall ADNS"; Filename: "{uninstallexe}"
+Name: "{commonprograms}\Uninstall ADNS"; Filename: "{uninstallexe}"
 
 [Run]
 ; Install Npcap silently before the app first launches (only when absent)
