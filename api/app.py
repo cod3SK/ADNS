@@ -1,6 +1,7 @@
 import hmac
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -745,6 +746,281 @@ def enforce_flow_retention() -> int:
     return purged
 
 
+# ---------------------------------------------------------------
+# Tshark capture helpers — in-process packet ingestion
+# ---------------------------------------------------------------
+
+_TSHARK_FIELDS = [
+    "frame.time_epoch", "ip.src", "ip.dst", "ip.proto", "frame.len",
+    "tcp.srcport", "tcp.dstport", "udp.srcport", "udp.dstport",
+    "dns.qry.name", "dns.qry.type", "dns.qry.class", "dns.flags.rcode",
+    "http.request.method", "http.request.full_uri", "http.user_agent",
+    "http.response.code", "http.content_length",
+    "ssl.handshake.version", "ssl.handshake.ciphersuite",
+]
+
+_TSHARK_PROTO_MAP = {
+    "1": "ICMP", "6": "TCP", "17": "UDP", "47": "GRE",
+    "50": "ESP", "51": "AH", "58": "ICMPV6", "132": "SCTP",
+}
+
+_TSHARK_SERVICE_PORTS = {
+    20: "ftp", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp",
+    53: "dns", 67: "dhcp", 68: "dhcp", 80: "http", 110: "pop3",
+    123: "ntp", 135: "rpc", 143: "imap", 161: "snmp", 389: "ldap",
+    443: "https", 445: "smb", 465: "smtps", 993: "imaps", 995: "pop3s",
+    1433: "mssql", 1521: "oracle", 3306: "mysql", 3389: "rdp", 5060: "sip",
+}
+
+
+def _find_tshark() -> str | None:
+    if hasattr(sys, "_MEIPASS"):
+        bundled = os.path.join(sys._MEIPASS, "tshark", "tshark.exe")
+        if os.path.isfile(bundled):
+            return bundled
+    for candidate in [
+        os.environ.get("TSHARK_BIN", ""),
+        r"C:\Program Files\Wireshark\tshark.exe",
+        shutil.which("tshark") or "",
+    ]:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _ts_safe_float(value: str, fallback: float) -> float:
+    try:
+        return float(value) if value else fallback
+    except ValueError:
+        return fallback
+
+
+def _ts_safe_int(value: str) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value, 16) if value.lower().startswith("0x") else int(value)
+    except ValueError:
+        digits = "".join(ch for ch in value if ch.isdigit())
+        return int(digits) if digits else None
+
+
+def _ts_proto(value: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return "OTHER"
+    return _TSHARK_PROTO_MAP.get(v, v.upper()) if v.isdigit() else v.upper()
+
+
+def _ts_service(proto, src_port, dst_port, dns_query, http_method, ssl_version):
+    if http_method:
+        return "http"
+    if ssl_version is not None or dst_port in {443, 8443}:
+        return "https"
+    if dns_query or dst_port == 53:
+        return "dns"
+    port = dst_port or src_port
+    return _TSHARK_SERVICE_PORTS.get(port, proto.lower()) if port else proto.lower()
+
+
+def _parse_tshark_line(line: str) -> dict | None:
+    n = len(_TSHARK_FIELDS)
+    parts = line.split("\t")
+    if len(parts) < n:
+        parts += [""] * (n - len(parts))
+    elif len(parts) > n:
+        parts = parts[:n]
+
+    src = parts[1] or ""
+    dst = parts[2] or ""
+    if not src or not dst:
+        return None
+
+    proto = _ts_proto(parts[3])
+    length = max(0, _ts_safe_int(parts[4]) or 0)
+    src_port = _ts_safe_int(parts[5]) or _ts_safe_int(parts[7]) or 0
+    dst_port = _ts_safe_int(parts[6]) or _ts_safe_int(parts[8]) or 0
+    dns_query = parts[9].strip()
+    dns_qtype = _ts_safe_int(parts[10])
+    dns_qclass = _ts_safe_int(parts[11])
+    dns_rcode = _ts_safe_int(parts[12])
+    http_method = parts[13].strip()
+    http_uri = parts[14].strip()
+    http_user_agent = parts[15].strip()
+    http_status = _ts_safe_int(parts[16])
+    http_content_len = _ts_safe_int(parts[17])
+    ssl_version = _ts_safe_int(parts[18])
+    ssl_cipher = parts[19].strip()
+
+    service = _ts_service(proto, src_port, dst_port, dns_query or None, http_method or None, ssl_version)
+
+    rec: dict = {
+        "ts": _ts_safe_float(parts[0], time.time()),
+        "src_ip": src, "dst_ip": dst, "proto": proto,
+        "bytes": length, "score": 0.0, "duration": 0.01,
+        "src_bytes": length, "dst_bytes": 0, "src_pkts": 1, "dst_pkts": 0,
+    }
+    if src_port: rec["src_port"] = src_port
+    if dst_port: rec["dst_port"] = dst_port
+    if service: rec["service"] = service
+    if dns_query: rec["dns_query"] = dns_query
+    if dns_qtype is not None: rec["dns_qtype"] = dns_qtype
+    if dns_qclass is not None: rec["dns_qclass"] = dns_qclass
+    if dns_rcode is not None: rec["dns_rcode"] = dns_rcode
+    if http_method: rec["http_method"] = http_method
+    if http_uri: rec["http_uri"] = http_uri
+    if http_user_agent: rec["http_user_agent"] = http_user_agent
+    if http_status is not None: rec["http_status_code"] = http_status
+    if http_content_len is not None:
+        key = "http_request_body_len" if http_method else "http_response_body_len"
+        rec[key] = http_content_len
+    if ssl_version is not None: rec["ssl_version"] = ssl_version
+    if ssl_cipher: rec["ssl_cipher"] = ssl_cipher
+    return rec
+
+
+def _build_tshark_cmd(tshark_bin: str, interface: str) -> list[str]:
+    cmd = [tshark_bin, "-i", interface, "-T", "fields"]
+    for field in _TSHARK_FIELDS:
+        cmd.extend(["-e", field])
+    cmd.extend(["-Y", "ip", "-l", "-E", "separator=\t", "-E", "header=n"])
+    return cmd
+
+
+class _CaptureAgent:
+    """Manages a tshark subprocess and ingests parsed flows directly into the DB."""
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._interface: str | None = None
+        self._start_time: float | None = None
+        self._flows_captured = 0
+        self._last_ingest: datetime | None = None
+        self._last_error: str | None = None
+        self._stop_evt = threading.Event()
+
+    def start(self, interface: str, tshark_bin: str) -> None:
+        with self._lock:
+            self._stop_internal()
+            self._stop_evt.clear()
+            self._interface = interface
+            self._flows_captured = 0
+            self._last_ingest = None
+            self._last_error = None
+            self._start_time = time.time()
+            try:
+                self._proc = subprocess.Popen(
+                    _build_tshark_cmd(tshark_bin, interface),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            except Exception as exc:
+                self._last_error = str(exc)
+                self._start_time = None
+                raise
+            self._thread = threading.Thread(
+                target=self._reader_loop, args=(self._proc,), daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_internal()
+
+    def _stop_internal(self) -> None:
+        self._stop_evt.set()
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = None
+        self._start_time = None
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def status(self) -> dict:
+        tshark_path = _find_tshark()
+        uptime = round(time.time() - self._start_time, 1) if self._start_time and self.running else None
+        return {
+            "running": self.running,
+            "interface": self._interface,
+            "tshark_found": tshark_path is not None,
+            "tshark_path": tshark_path,
+            "flows_captured": self._flows_captured,
+            "last_ingest": self._last_ingest.isoformat() if self._last_ingest else None,
+            "uptime_seconds": uptime,
+            "last_error": self._last_error,
+        }
+
+    def _reader_loop(self, proc: subprocess.Popen) -> None:
+        buf: list[dict] = []
+        last_flush = time.time()
+        BATCH_SIZE = 50
+        FLUSH_INTERVAL = 2.0
+
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if self._stop_evt.is_set():
+                    break
+                rec = _parse_tshark_line(line.strip())
+                if rec:
+                    buf.append(rec)
+                now = time.time()
+                if buf and (len(buf) >= BATCH_SIZE or now - last_flush >= FLUSH_INTERVAL):
+                    batch, buf = buf, []
+                    last_flush = now
+                    self._ingest_batch(batch)
+        except Exception as exc:
+            self._last_error = str(exc)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+
+    def _ingest_batch(self, batch: list[dict]) -> None:
+        try:
+            with app.app_context():
+                blocked_set = {r.ip for r in BlockedIP.query.filter_by(active=True).all()}
+                flow_records: list[Flow] = []
+                for rec in batch:
+                    src_ip = rec.get("src_ip", "")
+                    dst_ip = rec.get("dst_ip", "")
+                    if not src_ip or src_ip in blocked_set or dst_ip in blocked_set:
+                        continue
+                    flow_records.append(Flow(
+                        timestamp=parse_timestamp(rec.get("ts")),
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        proto=normalize_protocol(rec.get("proto", "")),
+                        bytes=int(rec.get("bytes") or 0),
+                        extra=build_flow_extra(rec),
+                    ))
+                    db.session.add(flow_records[-1])
+                if flow_records:
+                    db.session.flush()
+                    flow_ids = [f.id for f in flow_records]
+                    db.session.commit()
+                    enforce_flow_retention()
+                    enqueue_flow_scoring(flow_ids)
+                    with self._lock:
+                        self._flows_captured += len(flow_records)
+                        self._last_ingest = datetime.now(timezone.utc)
+        except Exception as exc:
+            self._last_error = str(exc)
+            app.logger.exception("capture batch ingest failed: %s", exc)
+
+
+_capture_agent = _CaptureAgent()
+
+
 init_db()
 
 # ---------------------------------------------------------------
@@ -1139,6 +1415,56 @@ def killswitch():
             "os_action": "ok" if os_ok else "failed",
         })
     return jsonify({"enabled": bool(KILL_SWITCH_STATE.get("enabled", False))})
+
+
+# ---------------------------------------------------------------
+# Capture agent — interface enumeration and lifecycle management
+# ---------------------------------------------------------------
+@app.get("/interfaces")
+def list_interfaces():
+    tshark = _find_tshark()
+    if not tshark:
+        return jsonify({"error": "tshark not found", "interfaces": []}), 503
+    try:
+        result = subprocess.run([tshark, "-D"], capture_output=True, text=True, timeout=5)
+        interfaces = []
+        for line in result.stdout.strip().splitlines():
+            m = re.match(r"(\d+)\.\s+(\S+)(?:\s+\((.+)\))?", line.strip())
+            if m:
+                idx, dev, name = int(m.group(1)), m.group(2), m.group(3) or m.group(2)
+                interfaces.append({"index": idx, "device": dev, "name": name})
+        return jsonify(interfaces)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "tshark -D timed out", "interfaces": []}), 504
+    except Exception as exc:
+        return jsonify({"error": str(exc), "interfaces": []}), 500
+
+
+@app.get("/agent/status")
+def agent_status():
+    return jsonify(_capture_agent.status())
+
+
+@app.post("/agent/start")
+def agent_start():
+    payload = request.get_json(silent=True) or {}
+    interface = str(payload.get("interface") or "").strip()
+    if not interface:
+        return jsonify({"error": "interface required"}), 400
+    tshark = _find_tshark()
+    if not tshark:
+        return jsonify({"error": "tshark not found"}), 503
+    try:
+        _capture_agent.start(interface, tshark)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"status": "started", "interface": interface})
+
+
+@app.post("/agent/stop")
+def agent_stop():
+    _capture_agent.stop()
+    return jsonify({"status": "stopped"})
 
 
 # ---------------------------------------------------------------

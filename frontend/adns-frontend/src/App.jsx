@@ -69,6 +69,19 @@ export default function App() {
   const [killBusy, setKillBusy] = useState(false);
   const [blockMessage, setBlockMessage] = useState("");
   const [blockedIps, setBlockedIps] = useState([]);
+  const [agentStatus, setAgentStatus] = useState(null);
+  const [interfaces, setInterfaces] = useState([]);
+  const [selectedIface, setSelectedIface] = useState("");
+  const [agentBusy, setAgentBusy] = useState(false);
+
+  const formatRelativeTime = (isoStr) => {
+    if (!isoStr) return "—";
+    const diff = Math.round((Date.now() - new Date(isoStr)) / 1000);
+    if (diff < 5) return "just now";
+    if (diff < 60) return `${diff}s ago`;
+    if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+    return `${Math.round(diff / 3600)}h ago`;
+  };
 
   const handleUnblock = async (ip) => {
     setBlockMessage("");
@@ -79,6 +92,51 @@ export default function App() {
     } catch (err) {
       console.error("unblock failed", err);
       setBlockMessage("Failed to unblock IP");
+    }
+  };
+
+  const fetchAgentStatus = useCallback(async () => {
+    try {
+      const res = await api.get("/api/agent/status");
+      setAgentStatus(res.data);
+    } catch {}
+  }, []);
+
+  const fetchInterfaces = useCallback(async () => {
+    try {
+      const res = await api.get("/api/interfaces");
+      const list = res.data || [];
+      setInterfaces(list);
+      setSelectedIface((prev) => {
+        if (prev) return prev;
+        const first = list.find((i) => !i.name.toLowerCase().includes("loopback"));
+        return first ? first.device : "";
+      });
+    } catch {}
+  }, []);
+
+  const startCapture = async () => {
+    if (!selectedIface) return;
+    setAgentBusy(true);
+    try {
+      await api.post("/api/agent/start", { interface: selectedIface });
+      await fetchAgentStatus();
+    } catch (err) {
+      setError("Failed to start capture: " + (err.response?.data?.error || err.message));
+    } finally {
+      setAgentBusy(false);
+    }
+  };
+
+  const stopCapture = async () => {
+    setAgentBusy(true);
+    try {
+      await api.post("/api/agent/stop");
+      await fetchAgentStatus();
+    } catch {
+      setError("Failed to stop capture");
+    } finally {
+      setAgentBusy(false);
     }
   };
 
@@ -127,6 +185,16 @@ export default function App() {
     };
     fetchKillSwitch();
   }, []);
+
+  useEffect(() => {
+    fetchInterfaces();
+  }, [fetchInterfaces]);
+
+  useEffect(() => {
+    fetchAgentStatus();
+    const id = setInterval(fetchAgentStatus, 3000);
+    return () => clearInterval(id);
+  }, [fetchAgentStatus]);
 
   const toggleKillSwitch = async () => {
     setKillBusy(true);
@@ -637,6 +705,88 @@ export default function App() {
                 ))}
               </ul>
             )}
+          </section>
+
+          <section className="panel capture-panel">
+            <div className="panel-heading">
+              <div className="panel-title-group">
+                <h3>Capture pipeline</h3>
+                <p>Live traffic ingestion via tshark.</p>
+              </div>
+            </div>
+
+            <div className="pipeline-indicators">
+              <div className="pipeline-row">
+                <span className="pipeline-label">tshark</span>
+                <span className={`status-dot ${agentStatus?.tshark_found ? "dot-ok" : "dot-err"}`} />
+                <span className="pipeline-value">
+                  {agentStatus == null ? "…" : agentStatus.tshark_found ? "Found" : "Not installed"}
+                </span>
+              </div>
+              <div className="pipeline-row">
+                <span className="pipeline-label">Capture</span>
+                <span className={`status-dot ${agentStatus?.running ? "dot-ok" : "dot-idle"}`} />
+                <span className="pipeline-value">
+                  {agentStatus?.running ? "Running" : "Stopped"}
+                </span>
+              </div>
+              {agentStatus?.running && (
+                <>
+                  <div className="pipeline-row">
+                    <span className="pipeline-label">Flows</span>
+                    <span className="pipeline-value">{agentStatus.flows_captured ?? 0} captured</span>
+                  </div>
+                  <div className="pipeline-row">
+                    <span className="pipeline-label">Last packet</span>
+                    <span className="pipeline-value">{formatRelativeTime(agentStatus.last_ingest)}</span>
+                  </div>
+                  {agentStatus.uptime_seconds != null && (
+                    <div className="pipeline-row">
+                      <span className="pipeline-label">Uptime</span>
+                      <span className="pipeline-value">{Math.round(agentStatus.uptime_seconds)}s</span>
+                    </div>
+                  )}
+                </>
+              )}
+              {agentStatus?.last_error && (
+                <p className="pipeline-error">{agentStatus.last_error}</p>
+              )}
+            </div>
+
+            <div className="capture-controls">
+              <select
+                className="iface-select"
+                value={selectedIface}
+                onChange={(e) => setSelectedIface(e.target.value)}
+                disabled={agentStatus?.running || agentBusy}
+              >
+                <option value="">Select interface…</option>
+                {interfaces.map((iface) => (
+                  <option key={iface.device} value={iface.device}>
+                    {iface.name}
+                  </option>
+                ))}
+              </select>
+              {agentStatus?.running ? (
+                <button
+                  type="button"
+                  className="simulate-btn is-active"
+                  onClick={stopCapture}
+                  disabled={agentBusy}
+                >
+                  Stop capture
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="simulate-btn"
+                  onClick={startCapture}
+                  disabled={!selectedIface || agentBusy || !agentStatus?.tshark_found}
+                >
+                  Start capture
+                </button>
+              )}
+            </div>
           </section>
         </aside>
       </div>

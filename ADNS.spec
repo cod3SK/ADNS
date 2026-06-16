@@ -3,6 +3,20 @@
 #   npm run build  (inside frontend/adns-frontend)
 #   pip install -r requirements-desktop.txt
 
+import glob
+import os
+
+# Bundle tshark + its DLLs so the app captures traffic without a separate Wireshark install.
+# Npcap (the packet capture driver) must still be installed on the target machine.
+_WIRESHARK_DIR = r"C:\Program Files\Wireshark"
+_tshark_datas = []
+if os.path.isdir(_WIRESHARK_DIR):
+    for _f in glob.glob(os.path.join(_WIRESHARK_DIR, "*.dll")):
+        _tshark_datas.append((_f, "tshark"))
+    _tshark_exe = os.path.join(_WIRESHARK_DIR, "tshark.exe")
+    if os.path.isfile(_tshark_exe):
+        _tshark_datas.append((_tshark_exe, "tshark"))
+
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 block_cipher = None
@@ -22,7 +36,7 @@ a = Analysis(
         ("api/model_artifacts", "model_artifacts"),
         # Flask app source files (all modules in api/)
         ("api/*.py", "api"),
-    ] + sklearn_datas + webview_datas,
+    ] + sklearn_datas + webview_datas + _tshark_datas,
     hiddenimports=[
         # Flask ecosystem
         "flask_cors",
