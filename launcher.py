@@ -9,6 +9,7 @@ works against Flask's routes without any route changes.
 """
 
 import os
+import socket
 import sys
 import threading
 import time
@@ -91,8 +92,20 @@ def _fatal(msg: str) -> None:
     sys.exit(1)
 
 
+def _port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def main() -> None:
     data_dir = _data_dir()
+
+    if _port_in_use(5000):
+        _fatal(
+            "Port 5000 is already in use.\n\n"
+            "Another application (or a leftover ADNS process) is running on port 5000.\n"
+            "Open Task Manager, find the process using port 5000, and close it, then try again."
+        )
 
     t = threading.Thread(target=_start_flask, args=(data_dir,), daemon=True)
     t.start()
