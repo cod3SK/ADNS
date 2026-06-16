@@ -9,3 +9,4 @@ scikit-learn
 joblib
 xgboost==1.7.6
 pywebview>=5.1
+pystray>=0.19

@@ -33,11 +33,12 @@ block_cipher = None
 # Collect all sklearn files — it uses a lot of data files and Cython extensions
 sklearn_datas, sklearn_binaries, sklearn_hiddenimports = collect_all("sklearn")
 webview_datas, webview_binaries, webview_hiddenimports = collect_all("webview")
+pystray_datas, pystray_binaries, pystray_hiddenimports = collect_all("pystray")
 
 a = Analysis(
     ["launcher.py"],
     pathex=["api"],          # so 'from app import ...' resolves
-    binaries=sklearn_binaries + webview_binaries,
+    binaries=sklearn_binaries + webview_binaries + pystray_binaries,
     datas=[
         # React production build
         ("frontend/adns-frontend/dist", "dist"),
@@ -47,7 +48,7 @@ a = Analysis(
         ("api/*.py", "api"),
         # App icon (used by the desktop shortcut)
         ("assets/icon.ico", "assets"),
-    ] + sklearn_datas + webview_datas + _tshark_datas + _npcap_datas,
+    ] + sklearn_datas + webview_datas + pystray_datas + _tshark_datas + _npcap_datas,
     hiddenimports=[
         # Flask ecosystem
         "flask_cors",
@@ -64,7 +65,11 @@ a = Analysis(
         "webview.platforms.winforms",
         "webview.platforms.edgechromium",
         "clr",
-    ] + sklearn_hiddenimports + webview_hiddenimports,
+        "pystray",
+        "pystray._win32",
+        "PIL",
+        "PIL.Image",
+    ] + sklearn_hiddenimports + webview_hiddenimports + pystray_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

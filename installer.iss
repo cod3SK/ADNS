@@ -81,10 +81,9 @@ Source: "dist\ADNS\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs cre
 Source: "npcap-installer.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NpcapMissing
 
 [Icons]
-; Desktop shortcut
+; Desktop shortcut — icon is embedded in ADNS.exe by PyInstaller
 Name: "{userdesktop}\ADNS"; Filename: "{app}\ADNS.exe"; \
-    Comment: "Anomaly Detection Network System"; \
-    IconFilename: "{app}\assets\icon.ico"
+    Comment: "Anomaly Detection Network System"
 
 ; Start Menu
 Name: "{group}\ADNS"; Filename: "{app}\ADNS.exe"; \

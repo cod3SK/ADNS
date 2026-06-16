@@ -40,7 +40,8 @@ if app.config["SQLALCHEMY_DATABASE_URI"].startswith("sqlite"):
 
 db = SQLAlchemy(app)
 
-MAX_FLOWS = 400  # keep last N flows when responding to dashboard clients
+DASHBOARD_WINDOW_MINUTES = 10  # how far back the dashboard queries
+MAX_FLOWS = 5000  # safety cap on rows returned per request
 FLOW_RETENTION_MINUTES = int(os.environ.get("ADNS_FLOW_RETENTION_MINUTES", "30"))
 FLOW_RETENTION_MAX_ROWS = int(os.environ.get("ADNS_FLOW_RETENTION_MAX_ROWS", "5000"))
 KILL_SWITCH_STATE = {"enabled": False}
@@ -235,7 +236,10 @@ def _run_cmd(cmd: list[str]) -> tuple[bool, str]:
     if USE_NSENTER and shutil.which("nsenter"):
         prefixed = ["nsenter", "-t", "1", "-n"] + cmd
     try:
-        proc = subprocess.run(prefixed, check=True, capture_output=True, text=True)
+        proc = subprocess.run(
+            prefixed, check=True, capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
         return True, proc.stdout.strip()
     except FileNotFoundError as exc:
         app.logger.error("command not found: %s", exc)
@@ -671,7 +675,7 @@ def flow_to_dict(flow: Flow) -> dict:
 
     return {
         "id": flow.id,
-        "ts": flow.timestamp.isoformat(),
+        "ts": flow.timestamp.replace(tzinfo=timezone.utc).isoformat() if flow.timestamp.tzinfo is None else flow.timestamp.isoformat(),
         "src_ip": flow.src_ip,
         "dst_ip": flow.dst_ip,
         "proto": normalize_protocol(flow.proto),
@@ -694,8 +698,14 @@ def is_anomalous_flow(flow: Flow) -> bool:
 
 
 def get_recent_flows(limit: int = MAX_FLOWS) -> list:
-    flows = Flow.query.order_by(Flow.timestamp.desc()).limit(limit).all()
-    # maintain chronological order (oldest first) for the dashboard
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=DASHBOARD_WINDOW_MINUTES)
+    flows = (
+        Flow.query
+        .filter(Flow.timestamp >= cutoff)
+        .order_by(Flow.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
     return list(reversed(flows))
 
 
@@ -931,6 +941,7 @@ class _CaptureAgent:
                     bufsize=1,
                     cwd=os.path.dirname(os.path.abspath(tshark_bin)),
                     env=_tshark_env(tshark_bin),
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
             except Exception as exc:
                 self._last_error = str(exc)
@@ -1291,9 +1302,10 @@ def flows():
         payload = [flow_to_dict(f) for f in recent]
         return jsonify(payload)
 
+    now = datetime.now(timezone.utc)
     demo_flows = [
         {
-            "ts": "2025-11-17T11:10:00Z",
+            "ts": (now - timedelta(seconds=9)).isoformat(),
             "src_ip": "192.168.1.10",
             "dst_ip": "8.8.8.8",
             "proto": "TCP",
@@ -1302,7 +1314,7 @@ def flows():
             "label": "normal",
         },
         {
-            "ts": "2025-11-17T11:10:05Z",
+            "ts": (now - timedelta(seconds=5)).isoformat(),
             "src_ip": "10.0.0.5",
             "dst_ip": "172.217.3.110",
             "proto": "TCP",
@@ -1311,7 +1323,7 @@ def flows():
             "label": "ddos",
         },
         {
-            "ts": "2025-11-17T11:10:09Z",
+            "ts": now.isoformat(),
             "src_ip": "192.168.1.23",
             "dst_ip": "1.1.1.1",
             "proto": "UDP",
@@ -1445,6 +1457,7 @@ def list_interfaces():
             capture_output=True, text=True, timeout=5,
             cwd=os.path.dirname(os.path.abspath(tshark)),
             env=_tshark_env(tshark),
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
         interfaces = []
         for line in result.stdout.strip().splitlines():

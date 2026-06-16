@@ -6,8 +6,12 @@ then opens a native pywebview window — no browser required.
 The _StripApiPrefix WSGI middleware rewrites /api/flows -> /flows etc. so
 the React build (which uses /api/* paths via the Vite proxy convention)
 works against Flask's routes without any route changes.
+
+Closing the window minimizes to tray. Left-click the tray icon to restore;
+right-click → Quit to exit completely.
 """
 
+import atexit
 import ctypes
 import os
 import socket
@@ -48,7 +52,11 @@ class _StripApiPrefix:
         return self._app(environ, start_response)
 
 
+_flask_server = None
+
+
 def _start_flask(data_dir: str) -> None:
+    global _flask_server
     api_dir = resource_path("api")
     if api_dir not in sys.path:
         sys.path.insert(0, api_dir)
@@ -66,13 +74,11 @@ def _start_flask(data_dir: str) -> None:
 
     app.wsgi_app = _StripApiPrefix(app.wsgi_app)
 
-    from werkzeug.serving import run_simple  # noqa: PLC0415
-    run_simple(
-        "127.0.0.1", 5000, app,
-        use_reloader=False,
-        use_debugger=False,
-        threaded=True,
-    )
+    from werkzeug.serving import make_server  # noqa: PLC0415
+    server = make_server("127.0.0.1", 5000, app, threaded=True)
+    _flask_server = server
+    server.serve_forever()
+    server.server_close()  # release the socket so the port is immediately reusable
 
 
 def _wait_for_api(url: str, timeout: float = 15.0) -> bool:
@@ -147,6 +153,32 @@ def _ensure_npcap() -> None:
         )
 
 
+def _build_tray(window):
+    """Create and return a pystray Icon wired to the webview window."""
+    import pystray
+    from PIL import Image
+
+    icon_path = resource_path("assets/icon.ico")
+    image = Image.open(icon_path)
+
+    def on_show(icon=None, item=None):
+        window.show()
+
+    def on_quit(icon, item):
+        icon.stop()
+        srv = _flask_server
+        if srv is not None:
+            srv.shutdown()
+        window.destroy()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open ADNS", on_show, default=True),
+        pystray.MenuItem("Quit", on_quit),
+    )
+
+    return pystray.Icon("ADNS", image, "ADNS", menu)
+
+
 def main() -> None:
     if sys.platform == "win32" and not _is_admin():
         _elevate()
@@ -173,16 +205,45 @@ def main() -> None:
             "Check Task Manager and close anything running on port 5000."
         )
 
+    # Flask is up — app module is imported. Register cleanup so tshark
+    # (a child subprocess) is terminated on exit; Windows does not auto-kill
+    # child processes when the parent exits.
+    def _stop_capture():
+        try:
+            from app import _capture_agent  # noqa: PLC0415
+            _capture_agent.stop()
+        except Exception:
+            pass
+
+    atexit.register(_stop_capture)
+
     import webview  # noqa: PLC0415  (not available in test env)
 
-    webview.create_window(
+    window = webview.create_window(
         "ADNS — Anomaly Detection Network System",
         "http://127.0.0.1:5000",
         width=1400,
         height=900,
         min_size=(1024, 600),
     )
+
+    tray = _build_tray(window)
+
+    def on_closing():
+        window.hide()
+        return False  # cancel the close; window stays alive hidden
+
+    window.events.closing += on_closing
+
+    tray_thread = threading.Thread(target=tray.run, daemon=True)
+    tray_thread.start()
+
     webview.start()
+
+    # webview.start() returns when window.destroy() is called from the tray.
+    # Flask and the tray thread are daemon threads and exit with the process.
+    # atexit handler above ensures tshark is terminated first.
+    sys.exit(0)
 
 
 if __name__ == "__main__":

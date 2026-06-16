@@ -68,6 +68,19 @@ export default function App() {
   const [interfaces, setInterfaces] = useState([]);
   const [selectedIface, setSelectedIface] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
+  const [timezone, setTimezone] = useState(
+    () => localStorage.getItem("adns_timezone") || Intl.DateTimeFormat().resolvedOptions().timeZone
+  );
+
+  const saveTimezone = (tz) => {
+    setTimezone(tz);
+    localStorage.setItem("adns_timezone", tz);
+  };
+
+  const formatTs = (isoStr) => {
+    if (!isoStr) return "—";
+    return new Date(isoStr).toLocaleString([], { timeZone: timezone });
+  };
 
   const formatRelativeTime = (isoStr) => {
     if (!isoStr) return "—";
@@ -257,6 +270,7 @@ export default function App() {
     const recent = [...sortedFlows].reverse().slice(-30);
     return recent.map((flow) => ({
       tsLabel: new Date(flow.ts).toLocaleTimeString([], {
+        timeZone: timezone,
         hour12: false,
         hour: "2-digit",
         minute: "2-digit",
@@ -286,7 +300,7 @@ export default function App() {
   const flowTableRows = (list) =>
     list.map((f, idx) => (
       <tr key={idx}>
-        <Td>{new Date(f.ts).toLocaleString()}</Td>
+        <Td>{formatTs(f.ts)}</Td>
         <Td>{f.src_ip}</Td>
         <Td>{f.dst_ip}</Td>
         <Td>{f.proto}</Td>
@@ -426,6 +440,7 @@ export default function App() {
                         <Line
                           type="monotone"
                           dataKey="score"
+                          isAnimationActive={false}
                           dot={({ payload }) => (
                             <circle
                               r={4}
@@ -504,6 +519,7 @@ export default function App() {
                           outerRadius={90}
                           dataKey="value"
                           paddingAngle={2}
+                          isAnimationActive={false}
                         >
                           {donutData.map((entry) => (
                             <Cell key={entry.severity} fill={threatColor(entry.severity)} />
@@ -555,6 +571,7 @@ export default function App() {
                         <Line
                           type="monotone"
                           dataKey="score"
+                          isAnimationActive={false}
                           dot={({ payload }) => (
                             <circle
                               r={4}
@@ -645,7 +662,7 @@ export default function App() {
                       <li key={row.ip}>
                         <div>
                           <div className="ip">{row.ip}</div>
-                          <div className="ts">{new Date(row.created_at).toLocaleString()}</div>
+                          <div className="ts">{formatTs(row.created_at)}</div>
                         </div>
                         <div className="row-actions">
                           <span
@@ -766,6 +783,26 @@ export default function App() {
                       Start capture
                     </button>
                   )}
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-heading">
+                  <div className="panel-title-group">
+                    <h3>Display</h3>
+                    <p>Timezone used for all timestamps in the dashboard.</p>
+                  </div>
+                </div>
+                <div className="capture-controls">
+                  <select
+                    className="iface-select"
+                    value={timezone}
+                    onChange={(e) => saveTimezone(e.target.value)}
+                  >
+                    {Intl.supportedValuesOf("timeZone").map((tz) => (
+                      <option key={tz} value={tz}>{tz}</option>
+                    ))}
+                  </select>
                 </div>
               </section>
             </div>
