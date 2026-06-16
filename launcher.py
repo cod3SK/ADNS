@@ -143,7 +143,8 @@ def _ensure_npcap() -> None:
             0x01,
         )
         if ok == 1:
-            subprocess.run([installer, "/S"], check=True, timeout=120)
+            # No /S flag — Npcap's driver signing can block silent installs.
+            subprocess.run([installer], check=True, timeout=300)
         else:
             sys.exit(0)
     else:

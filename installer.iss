@@ -90,9 +90,10 @@ Name: "{commonprograms}\ADNS"; Filename: "{app}\ADNS.exe"; \
 Name: "{commonprograms}\Uninstall ADNS"; Filename: "{uninstallexe}"
 
 [Run]
-; Install Npcap silently before the app first launches (only when absent)
-Filename: "{tmp}\npcap-installer.exe"; Parameters: "/S"; \
-    Description: "Installing Npcap (required for packet capture)..."; \
+; Install Npcap before the app first launches (only when absent).
+; No /S flag — Npcap's driver signing can block fully-silent installs.
+Filename: "{tmp}\npcap-installer.exe"; \
+    Description: "Install Npcap (required for packet capture)"; \
     Flags: waituntilterminated; Check: NpcapMissing
 
 ; Offer to launch the app after installation completes
