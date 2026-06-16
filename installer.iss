@@ -67,9 +67,7 @@ SolidCompression=yes
 WizardStyle=modern
 DisableProgramGroupPage=yes
 CloseApplications=yes
-; Uncomment once assets\icon.ico exists:
-; SetupIconFile=assets\icon.ico
-; WizardSmallImageFile=assets\wizard_small.bmp
+SetupIconFile=assets\icon.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -85,9 +83,8 @@ Source: "npcap-installer.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Chec
 [Icons]
 ; Desktop shortcut
 Name: "{userdesktop}\ADNS"; Filename: "{app}\ADNS.exe"; \
-    Comment: "Anomaly Detection Network System"
-; Uncomment icon= lines once assets\icon.ico is bundled:
-;   IconFilename: "{app}\assets\icon.ico"
+    Comment: "Anomaly Detection Network System"; \
+    IconFilename: "{app}\assets\icon.ico"
 
 ; Start Menu
 Name: "{group}\ADNS"; Filename: "{app}\ADNS.exe"; \

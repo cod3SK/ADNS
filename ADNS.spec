@@ -45,6 +45,8 @@ a = Analysis(
         ("api/model_artifacts", "model_artifacts"),
         # Flask app source files (all modules in api/)
         ("api/*.py", "api"),
+        # App icon (used by the desktop shortcut)
+        ("assets/icon.ico", "assets"),
     ] + sklearn_datas + webview_datas + _tshark_datas + _npcap_datas,
     hiddenimports=[
         # Flask ecosystem
@@ -53,7 +55,6 @@ a = Analysis(
         "sqlalchemy.dialects.sqlite",
         "sqlalchemy.dialects.sqlite.pysqlite",
         "sqlalchemy.pool.impl",
-        "sqlalchemy.pool.manage",
         # ML stack
         "joblib",
         "numpy",
@@ -95,7 +96,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,        # no terminal window on Windows
-    icon=None,            # replace with "assets/icon.ico" if you add one
+    icon="assets/icon.ico",
 )
 
 coll = COLLECT(
