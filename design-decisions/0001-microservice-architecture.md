@@ -42,3 +42,17 @@ behind an optional `agent` compose profile so the rest of the stack runs anywher
 - Cost: more moving parts to orchestrate and a richer set of failure modes, which
   motivates the resilience decisions in [0002](0002-async-scoring-redis-rq.md) and
   [0003](0003-three-tier-detection-cascade.md).
+
+## Amendment — Windows desktop packaging collapses the service boundary
+
+The system now ships a second distribution path alongside Docker Compose: a
+self-contained Windows installer built with PyInstaller + Inno Setup (see
+[0010](0010-windows-desktop-packaging.md)). In that mode the "microservices" are
+co-located inside one process: Flask serves both the API and the bundled React
+`dist/`, the thread-pool scorer runs in-process, and packet capture is handled by
+the bundled `tshark` binary launched as a child process.
+
+The service decomposition still holds conceptually — the code paths are the same —
+but the deployment topology reduces to a single executable with no external
+dependencies. The Docker Compose stack remains the reference for Linux/CI
+deployments where the boundaries matter operationally.

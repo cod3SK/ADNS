@@ -2,7 +2,9 @@
 
 [![CI](https://github.com/OffensiveGeneric/ADNS/actions/workflows/ci.yml/badge.svg)](https://github.com/OffensiveGeneric/ADNS/actions/workflows/ci.yml)
 
-ADNS is an end-to-end demo of a modern network anomaly detection platform. It ingests live packet captures, stores recent flows in PostgreSQL, scores them asynchronously via an in-process thread pool with a DetectionEngine (meta ensemble → sklearn → heuristics), and visualizes detections on a React dashboard. Attack scenarios are driven from the CLI tool in `core/attack_generator.py`, not the dashboard.
+ADNS is an end-to-end demo of a modern network anomaly detection platform. It ingests live packet captures, stores recent flows in SQLite (or PostgreSQL), scores them asynchronously via an in-process thread pool with a DetectionEngine (meta ensemble → sklearn → heuristics), and visualizes detections on a React dashboard. Attack scenarios are driven from the CLI tool in `core/attack_generator.py`, not the dashboard.
+
+The easiest way to run ADNS is the [Windows desktop installer](#desktop-app--windows-no-setup-required) — one download, no prerequisites.
 
 ## Architecture
 <img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/3c972f97-f751-4c92-9d10-fb54f326c4b3" />
@@ -13,11 +15,11 @@ ADNS is an end-to-end demo of a modern network anomaly detection platform. It in
 | Packet capture agent | `agent/` | `capture.py` wraps `tshark`, normalizes packet metadata into flow JSON, and POSTs batches to `/api/ingest`. |
 | Flask API | `api/` | Persists flows/predictions, exposes `/flows`, `/anomalies`, `/simulate`, and submits flow IDs to an in-process thread pool for scoring. |
 | Thread pool scorer | `api/task_queue.py`, `api/tasks.py` | `ThreadPoolExecutor` that runs `score_flow_batch` in background threads inside app context. |
-| Frontend dashboard | `frontend/adns-frontend/` | Vite/React UI with anomaly charts and severity donut. |
+| Frontend dashboard | `frontend/adns-frontend/` | Vite/React UI with a left nav rail and four tabs: Dashboard (charts + metrics), Flows (filterable flow table), Flows Manager (anomalous flows + blocked IPs), and Settings (capture pipeline). |
 | ML lab | `ml/` | Preprocessing scripts (`preprocess/`), meta-model notebooks, and `train_flow_detector.py` for the live scorer. |
 | Model artifacts | `api/model_artifacts/` | `meta_model_combined.joblib` (ExtraTrees+XGBoost) + `flow_detector.joblib` (sklearn pipeline). |
 | Attack generator | `core/attack_generator.py` | Stdlib-only CLI; generates synthetic attack flows and POSTs them to `/ingest` for live demo runs. |
-| Ops | `deployment/`, `worker/`, `assets/` | Systemd units, scripts, and misc assets. Research docs live in `docs/`. |
+| Ops | `scripts/`, `design-decisions/`, `docs/` | Build scripts (`build_installer.ps1`, `setup_local.*`), ADRs, and research docs. |
 
 Generated datasets live under `data/`, and derived artifacts (clean CSVs, model outputs) live under `outputs/`; both are gitignored to keep the repo lean.
 
@@ -35,6 +37,9 @@ The significant design choices are recorded as [Architecture Decision Records](d
 - **[Fail-closed admin-token gate](design-decisions/0007-admin-token-gate-for-response-actions.md)** — `/block_ip` and `/unblock_ip` are disabled unless `ADNS_ADMIN_TOKEN` is set, then require a bearer/header token. `/killswitch` is ungated so it works immediately from the dashboard.
 - **[Externalized configuration and secrets](design-decisions/0008-externalized-configuration-and-secrets.md)** — credentials come from the environment with demo-only defaults; no real secret lives in source.
 - **[Test strategy and CI](design-decisions/0009-test-strategy-and-ci.md)** — tests run against the heuristic + SQLite paths, so the full suite is fast, dependency-light, and runs in CI on every push.
+- **[Windows desktop packaging](design-decisions/0010-windows-desktop-packaging.md)** — PyInstaller bundles Flask, ML models, tshark binaries, and the React build into a single exe; Inno Setup wraps it into an installer with silent Npcap bundling and UAC self-elevation.
+- **[Tabbed left-nav layout](design-decisions/0011-tabbed-navigation-layout.md)** — replaces the scrolling single-page layout with a four-tab nav rail (Dashboard, Flows, Flows Manager, Settings) to separate visualization, data browsing, active response, and pipeline controls.
+- **[Installer versioning and update safety](design-decisions/0012-installer-versioning-and-update-safety.md)** — adds a fixed `AppId` GUID, wires the version param through `iscc /D`, and enables `CloseApplications=yes` so updates install cleanly without duplicate registry entries or skipped file overwrites.
 
 See also the [**model card**](ml/model_card.md) for the detectors' training data, metrics, and limitations.
 
@@ -44,28 +49,32 @@ If you just want to open ADNS and see it working — no Python, Node.js, or Dock
 
 1. Go to the [Releases page](https://github.com/OffensiveGeneric/ADNS/releases) and download **`ADNS_installer.exe`**.
 2. Run the installer and click **Next** through the wizard. No administrator password is required — it installs to your personal user folder.
-3. When the wizard finishes, click **Launch ADNS now** (or double-click the desktop shortcut any time after that).
+3. If [Npcap](https://npcap.com) is not already on your machine the installer will install it silently for you (it is required for packet capture).
+4. When the wizard finishes, click **Launch ADNS now** (or double-click the desktop shortcut any time after that).
 
-The app opens in its own window with everything running inside it. Your data is saved in `%AppData%\ADNS\adns.db` — uninstalling the app leaves that file in place so you don't lose history.
+The app opens in its own window with everything running inside it — Flask API, React UI, and ML models are all bundled. Your data is saved in `%AppData%\ADNS\adns.db` — uninstalling the app leaves that file in place so you don't lose history.
 
 > The first launch may take a few seconds while the detection engine loads — this is normal.
 
 ### Building the installer yourself (developers only)
 
-You will need three free tools installed first:
+You will need four things in place before running the build script:
 
-- [Node.js 18+](https://nodejs.org) — download and run the installer, accept all defaults
-- [Python 3.10+](https://python.org/downloads) — download and run the installer; **check "Add Python to PATH"** on the first screen
-- [Inno Setup 6](https://jrsoftware.org/isinfo.php) — download and run the installer, accept all defaults
+| Requirement | Where to get it | Notes |
+|---|---|---|
+| [Node.js 18+](https://nodejs.org) | nodejs.org | Accept all defaults |
+| [Python 3.10+](https://python.org/downloads) | python.org | **Check "Add Python to PATH"** on the first screen |
+| [Inno Setup 6](https://jrsoftware.org/isinfo.php) | jrsoftware.org | Accept all defaults |
+| `npcap-installer.exe` in repo root | [npcap.com](https://npcap.com) | Download the latest installer, rename it to `npcap-installer.exe`, and drop it in the repo root. The build script will abort with a clear message if this is missing. |
 
 Then open PowerShell in the repo root and run:
 
 ```powershell
 pip install -r requirements-desktop.txt pyinstaller
-pwsh scripts\build_installer.ps1
+pwsh scripts\build_installer.ps1 -Version 0.0.1
 ```
 
-The finished installer is written to `Output\ADNS_installer.exe`. The GitHub Actions workflow (`.github/workflows/build-installer.yml`) runs the same steps automatically whenever a version tag is pushed and attaches the result to the GitHub Release.
+Pass `-Version` to stamp the version shown in Add/Remove Programs (defaults to `0.0.1` if omitted). The finished installer is written to `Output\ADNS_installer.exe`. The GitHub Actions workflow (`.github/workflows/build-installer.yml`) runs the same steps automatically whenever a version tag is pushed and attaches the result to the GitHub Release.
 
 ## Quickstart — Docker first
 Prereqs: Docker + Docker Compose, Git.
@@ -168,7 +177,7 @@ npm run dev   # for hot reload
 npm run build && npm run preview   # for production bundle
 ```
 
-Building places static assets under `dist/`. Set `VITE_API_URL` before `npm run build` if the UI is hosted separately; the production droplet serves that folder via Nginx at `http://159.203.105.167/`.
+Building places static assets under `dist/`. Set `VITE_API_URL` before `npm run build` if the UI is hosted separately from the API.
 
 ### 4. Training & Data Pipelines
 

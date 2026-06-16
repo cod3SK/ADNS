@@ -44,6 +44,15 @@ Making correctness observable and regressions catchable.
 | --- | --- | --- |
 | [0009](0009-test-strategy-and-ci.md) | Lightweight test strategy and continuous integration | Accepted |
 
+### Phase 3 — Desktop packaging and distribution
+Shipping a self-contained Windows installer and hardening the update story.
+
+| ADR | Title | Status |
+| --- | --- | --- |
+| [0010](0010-windows-desktop-packaging.md) | Windows desktop packaging with PyInstaller and Inno Setup | Accepted |
+| [0011](0011-tabbed-navigation-layout.md) | Tabbed left-nav layout for the dashboard | Accepted |
+| [0012](0012-installer-versioning-and-update-safety.md) | Installer versioning and update safety | Accepted |
+
 ## Related documents
 - [`../ml/model_card.md`](../ml/model_card.md) — model card for the two detectors.
 - [`../README.md`](../README.md) — project overview and quickstart.

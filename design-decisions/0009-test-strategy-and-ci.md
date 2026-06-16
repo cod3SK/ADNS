@@ -21,7 +21,8 @@ dependencies:
 - Force the **heuristic** detection tier by pointing the model-artifact paths at
   non-existent files, so no xgboost/sklearn/joblib model load is needed.
 - Disable reverse-DNS and host `nsenter` in the test environment.
-- Exercise the no-Redis path, which validates the inline-scoring fallback for free.
+- Scoring runs via the in-process `ThreadPoolExecutor` (Redis/RQ was removed — see
+  [0002](0002-async-scoring-redis-rq.md)); no queue service is required.
 
 The suite (`api/tests/`) covers endpoints, payload validation, the admin-token
 gate, simulation, blocked-IP filtering, the heuristic scorer, and the meta feature
