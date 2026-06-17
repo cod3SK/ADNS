@@ -1246,7 +1246,8 @@ class _BatchCaptureAgent:
                 break
             try:
                 pcaps = sorted(
-                    _glob.glob(os.path.join(batch_dir, "cap_*.pcap")),
+                    _glob.glob(os.path.join(batch_dir, "cap_*.pcap"))
+                    + _glob.glob(os.path.join(batch_dir, "cap_*.pcapng")),
                     key=os.path.getmtime,
                 )
                 for pcap_path in pcaps[:-1] if len(pcaps) > 1 else []:
