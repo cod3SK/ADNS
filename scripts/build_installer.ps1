@@ -9,14 +9,25 @@
 #   - npcap-installer.exe in repo root
 #       Download from https://npcap.com, rename to npcap-installer.exe
 
-param(
-    [string]$Version = "0.0.1"
-)
-
 $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
 
-Write-Host "==> Building ADNS $Version installer" -ForegroundColor Cyan
+# --- Read and increment version ----------------------------------------
+$versionFile = "$Root\VERSION"
+$version = (Get-Content $versionFile -Raw).Trim()   # e.g. "0.00.001"
+
+$parts = $version -split '\.'                        # ["0","00","001"]
+$patch  = [int]$parts[2] + 1
+$nextVersion = "$($parts[0]).$($parts[1]).$($patch.ToString().PadLeft(3,'0'))"
+
+# Stamp the version into api\_version.py before PyInstaller runs
+"__version__ = `"$version`"" | Set-Content "$Root\api\_version.py" -Encoding UTF8
+
+# Advance VERSION file for the NEXT build
+Set-Content $versionFile "$nextVersion`n" -Encoding UTF8 -NoNewline
+
+Write-Host "==> Building ADNS $version installer" -ForegroundColor Cyan
+# ------------------------------------------------------------------------
 
 # --- Preflight checks ---------------------------------------------------
 $missing = @()
@@ -63,10 +74,10 @@ if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
 # 3. Inno Setup
 Write-Host "`n[3/3] Building installer with Inno Setup..." -ForegroundColor Yellow
-& $iscc /DMyAppVersion=$Version installer.iss
+& $iscc /DMyAppVersion=$version installer.iss
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
 
-$output = "$Root\Output\ADNS_installer.exe"
+$output = "$Root\Output\ADNS_Installer_v$version.exe"
 if (Test-Path $output) {
     $size = [math]::Round((Get-Item $output).Length / 1MB, 1)
     Write-Host "`nDone! $output ($size MB)" -ForegroundColor Green

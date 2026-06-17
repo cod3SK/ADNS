@@ -916,6 +916,20 @@ export default function App() {
               <section className="panel">
                 <div className="panel-heading">
                   <div className="panel-title-group">
+                    <h3>About</h3>
+                  </div>
+                </div>
+                <div className="pipeline-indicators">
+                  <div className="pipeline-row">
+                    <span className="pipeline-label">Version</span>
+                    <span className="pipeline-value">{captureStatus?.version ?? "…"}</span>
+                  </div>
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-heading">
+                  <div className="panel-title-group">
                     <h3>Display</h3>
                     <p>Timezone used for all timestamps in the dashboard.</p>
                   </div>

@@ -20,6 +20,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from model_runner import DetectionEngine
 from task_queue import enqueue_flow_scoring
 
+try:
+    from _version import __version__ as _APP_VERSION
+except ImportError:
+    _APP_VERSION = "dev"
+
 app = Flask(__name__)
 CORS(app)
 
@@ -1136,7 +1141,6 @@ _BATCH_PASS2_FIELDS = [
 ]
 
 _BATCH_WINDOW_SECONDS = 15
-_BATCH_MAX_FILES = 4
 
 _BATCH_PROTO_MAP = {
     "1": "ICMP", "6": "TCP", "17": "UDP",
@@ -1214,63 +1218,68 @@ class _BatchCaptureAgent:
         }
 
     def _run_loop(self) -> None:
-        import glob as _glob
-        batch_dir = self._batch_dir
         tshark_bin = self._tshark_bin
-        pcap_base = os.path.join(batch_dir, "cap")
-        cmd = [
-            tshark_bin, "-i", self._interface,
-            "-b", f"duration:{_BATCH_WINDOW_SECONDS}",
-            "-b", f"files:{_BATCH_MAX_FILES}",
-            "-w", pcap_base, "-q",
-        ]
-        try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                cwd=os.path.dirname(os.path.abspath(tshark_bin)),
-                env=_tshark_env(tshark_bin),
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-            self.running = True
-        except Exception as exc:
-            self._last_error = str(exc)
-            return
+        batch_dir = self._batch_dir
+        self.running = True
+        seq = 0
 
-        processed: set = set()
         while not self._stop_evt.is_set():
-            if self._proc.poll() is not None:
-                if not self._stop_evt.is_set():
-                    self._last_error = f"tshark ring-buffer exited (code {self._proc.returncode})"
-                self.running = False
-                break
+            seq += 1
+            pcap_path = os.path.join(batch_dir, f"cap_{seq:04d}.pcap")
+            cmd = [
+                tshark_bin, "-i", self._interface,
+                "-a", f"duration:{_BATCH_WINDOW_SECONDS}",
+                "-F", "pcap",
+                "-w", pcap_path, "-q",
+            ]
             try:
-                pcaps = sorted(
-                    _glob.glob(os.path.join(batch_dir, "cap_*.pcap"))
-                    + _glob.glob(os.path.join(batch_dir, "cap_*.pcapng")),
-                    key=os.path.getmtime,
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    cwd=os.path.dirname(os.path.abspath(tshark_bin)),
+                    env=_tshark_env(tshark_bin),
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
-                for pcap_path in pcaps[:-1] if len(pcaps) > 1 else []:
-                    if pcap_path in processed:
-                        continue
-                    try:
-                        flows = self._process_pcap(pcap_path, tshark_bin)
-                        if flows:
-                            self._ingest(flows)
-                            self._batches_processed += 1
-                            self._last_batch = datetime.utcnow()
-                        processed.add(pcap_path)
-                        try:
-                            os.unlink(pcap_path)
-                            processed.discard(pcap_path)
-                        except OSError:
-                            pass
-                    except Exception as exc:
-                        self._last_error = str(exc)
-                        app.logger.exception("batch pcap processing failed: %s", exc)
+                with self._lock:
+                    self._proc = proc
             except Exception as exc:
                 self._last_error = str(exc)
-            self._stop_evt.wait(2.0)
+                self.running = False
+                return
+
+            # Poll until tshark finishes the capture window or stop is requested
+            while proc.poll() is None:
+                if self._stop_evt.wait(1.0):
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    self.running = False
+                    return
+
+            if proc.returncode != 0:
+                self._last_error = f"tshark exited with code {proc.returncode}"
+                if self._stop_evt.wait(5.0):
+                    break
+                continue
+
+            if os.path.exists(pcap_path):
+                try:
+                    flows = self._process_pcap(pcap_path, tshark_bin)
+                    if flows:
+                        self._ingest(flows)
+                        self._batches_processed += 1
+                        self._last_batch = datetime.utcnow()
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    app.logger.exception("batch pcap processing failed: %s", exc)
+                finally:
+                    try:
+                        os.unlink(pcap_path)
+                    except OSError:
+                        pass
+
         self.running = False
 
     def _process_pcap(self, pcap: str, tshark_bin: str) -> list[dict]:
@@ -2012,6 +2021,7 @@ def agent_status():
 def capture_status():
     tshark = _find_tshark()
     return jsonify({
+        "version": _APP_VERSION,
         "interface": _detected_interface,
         "tshark_found": tshark is not None,
         "live": _capture_agent.status(),

@@ -49,7 +49,7 @@
 
 [Setup]
 AppId={{8EC917E9-8DB8-4681-A41E-2A03D9FEFE33}
-AppName=ADNS
+AppName=ADNS v{#MyAppVersion}
 AppVersion={#MyAppVersion}
 AppPublisherURL=https://github.com/OffensiveGeneric/ADNS
 AppSupportURL=https://github.com/OffensiveGeneric/ADNS/issues
@@ -59,7 +59,7 @@ DefaultGroupName=ADNS
 ; Require admin so the installer can write Npcap and firewall rules.
 PrivilegesRequired=admin
 OutputDir=Output
-OutputBaseFilename=ADNS_installer
+OutputBaseFilename=ADNS_Installer_v{#MyAppVersion}
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
