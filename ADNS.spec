@@ -60,6 +60,8 @@ a = Analysis(
         "flask_sqlalchemy",
         "sqlalchemy.dialects.sqlite",
         "sqlalchemy.dialects.sqlite.pysqlite",
+        "sqlalchemy.dialects.postgresql",
+        "sqlalchemy.dialects.postgresql.base",
         "sqlalchemy.pool.impl",
         # ML stack
         "joblib",

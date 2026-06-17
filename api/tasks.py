@@ -5,7 +5,10 @@ import os
 from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+try:
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+except ImportError:  # postgresql dialect not bundled (e.g. PyInstaller SQLite-only build)
+    pg_insert = None  # type: ignore[assignment]
 from sqlalchemy.exc import IntegrityError
 
 from app import Flow, Prediction, app, db
@@ -58,7 +61,7 @@ def _insert_predictions(records: list[dict]) -> int:
 
     bind = db.session.get_bind()
     dialect = getattr(bind, "dialect", None)
-    if dialect and dialect.name == "postgresql":
+    if pg_insert is not None and dialect and dialect.name == "postgresql":
         stmt = pg_insert(Prediction).values(records).on_conflict_do_nothing(index_elements=["flow_id"])
         result = db.session.execute(stmt)
         return result.rowcount or 0
