@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +14,13 @@ import joblib
 import numpy as np
 import pandas as pd
 
-BASE_DIR = Path(__file__).resolve().parent
+# In the PyInstaller bundle, launcher.py inserts sys._MEIPASS/api into sys.path,
+# so __file__ resolves inside api/.  Model artifacts are bundled one level up at
+# sys._MEIPASS/model_artifacts/, so we must root from sys._MEIPASS when frozen.
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    BASE_DIR = Path(sys._MEIPASS)
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_META_MODEL_PATH = BASE_DIR / "model_artifacts" / "meta_model_combined.joblib"
 
 logger = logging.getLogger(__name__)

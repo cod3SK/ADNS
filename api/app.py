@@ -1235,7 +1235,7 @@ class _BatchCaptureAgent:
             try:
                 proc = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     cwd=os.path.dirname(os.path.abspath(tshark_bin)),
                     env=_tshark_env(tshark_bin),
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -1258,8 +1258,16 @@ class _BatchCaptureAgent:
                     self.running = False
                     return
 
+            stderr_out = ""
+            if proc.stderr:
+                try:
+                    stderr_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+
             if proc.returncode != 0:
-                self._last_error = f"tshark exited with code {proc.returncode}"
+                detail = f": {stderr_out[:300]}" if stderr_out else ""
+                self._last_error = f"tshark exited code {proc.returncode}{detail}"
                 if self._stop_evt.wait(5.0):
                     break
                 continue
