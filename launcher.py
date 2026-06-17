@@ -106,24 +106,27 @@ def _port_in_use(port: int) -> bool:
 
 
 def _kill_port(port: int) -> bool:
-    """Kill whatever process owns the given TCP port. Returns True if port is now free."""
+    """Kill whatever process is listening on *port*. Returns True once port is free."""
     import subprocess as _sp
+    script = (
+        f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue; "
+        f"if ($c) {{ Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue }}"
+    )
     try:
-        out = _sp.check_output(
-            ["netstat", "-ano"],
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-        ).decode("utf-8", errors="replace")
-        for line in out.splitlines():
-            if f":{port}" in line and "LISTENING" in line:
-                parts = line.split()
-                pid = int(parts[-1])
-                if pid and pid != os.getpid():
-                    _sp.run(["taskkill", "/F", "/PID", str(pid)],
-                            creationflags=0x08000000, capture_output=True)
+        _sp.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            creationflags=0x08000000,
+            capture_output=True,
+            timeout=10,
+        )
     except Exception:
         pass
-    time.sleep(0.5)
-    return not _port_in_use(port)
+    # Wait up to 3 s for the OS to release the socket
+    for _ in range(6):
+        time.sleep(0.5)
+        if not _port_in_use(port):
+            return True
+    return False
 
 
 def _is_admin() -> bool:
