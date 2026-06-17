@@ -50,6 +50,7 @@
 [Setup]
 AppId={{8EC917E9-8DB8-4681-A41E-2A03D9FEFE33}
 AppName=ADNS v{#MyAppVersion}
+AppVerName=ADNS v{#MyAppVersion}
 AppPublisherURL=https://github.com/OffensiveGeneric/ADNS
 AppSupportURL=https://github.com/OffensiveGeneric/ADNS/issues
 UninstallDisplayName=ADNS - Anomaly Detection Network System
