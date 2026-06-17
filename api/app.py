@@ -1,4 +1,5 @@
 import hmac
+import json
 import os
 import random
 import re
@@ -13,7 +14,7 @@ from functools import wraps
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from model_runner import DetectionEngine
@@ -44,6 +45,7 @@ DASHBOARD_WINDOW_MINUTES = 10  # how far back the dashboard queries
 MAX_FLOWS = 5000  # safety cap on rows returned per request
 FLOW_RETENTION_MINUTES = int(os.environ.get("ADNS_FLOW_RETENTION_MINUTES", "30"))
 FLOW_RETENTION_MAX_ROWS = int(os.environ.get("ADNS_FLOW_RETENTION_MAX_ROWS", "5000"))
+BATCH_FLOW_RETENTION_MINUTES = int(os.environ.get("ADNS_BATCH_FLOW_RETENTION_MINUTES", "65"))
 KILL_SWITCH_STATE = {"enabled": False}
 USE_NSENTER = os.environ.get("ADNS_NSENTER_HOST", "true").lower() not in {"0", "false", "no"}
 # block_ip / unblock_ip shell out to iptables on the host namespace and are
@@ -118,6 +120,7 @@ class Flow(db.Model):
     proto = db.Column(db.String(16), nullable=False)
     bytes = db.Column(db.Integer, nullable=False, default=0)
     extra = db.Column(db.JSON, nullable=True)
+    source = db.Column(db.String(16), nullable=True, server_default="live", index=True)
 
     predictions = db.relationship("Prediction", backref="flow", lazy="dynamic", cascade="all, delete-orphan")
 
@@ -142,6 +145,31 @@ class BlockedIP(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+def ensure_flow_source_column() -> None:
+    """Add flows.source column and backfill existing rows to 'live' if missing."""
+    try:
+        inspector = inspect(db.engine)
+        columns = {col["name"] for col in inspector.get_columns("flows")}
+    except SQLAlchemyError as exc:
+        app.logger.warning("failed to inspect flows table: %s", exc)
+        return
+
+    if "source" not in columns:
+        try:
+            with db.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE flows ADD COLUMN source VARCHAR(16) DEFAULT 'live'"))
+            app.logger.info("added flows.source column")
+        except SQLAlchemyError as exc:
+            app.logger.error("failed to add flows.source column: %s", exc)
+            return
+
+    try:
+        with db.engine.begin() as conn:
+            conn.execute(text("UPDATE flows SET source = 'live' WHERE source IS NULL"))
+    except SQLAlchemyError as exc:
+        app.logger.warning("failed to backfill flows.source: %s", exc)
+
+
 def init_db() -> None:
     with app.app_context():
         db.create_all()
@@ -150,6 +178,7 @@ def init_db() -> None:
             db.session.commit()
         ensure_flow_extra_column()
         ensure_prediction_flow_unique_index()
+        ensure_flow_source_column()
 
 
 def ensure_flow_extra_column() -> None:
@@ -605,6 +634,10 @@ EXTRA_INT_FIELDS = {
     "dns_qclass",
     "dns_qtype",
     "dns_rcode",
+    "dns_AA",
+    "dns_RD",
+    "dns_RA",
+    "dns_rejected",
     "http_status_code",
     "http_request_body_len",
     "http_response_body_len",
@@ -701,12 +734,16 @@ def get_recent_flows(limit: int = MAX_FLOWS) -> list:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=DASHBOARD_WINDOW_MINUTES)
     flows = (
         Flow.query
+        .filter(_LIVE_FLOW_FILTER)
         .filter(Flow.timestamp >= cutoff)
         .order_by(Flow.timestamp.desc())
         .limit(limit)
         .all()
     )
     return list(reversed(flows))
+
+
+_LIVE_FLOW_FILTER = or_(Flow.source.is_(None), Flow.source != "batch")
 
 
 def enforce_flow_retention() -> int:
@@ -724,6 +761,7 @@ def enforce_flow_retention() -> int:
         while True:
             stale_ids = (
                 Flow.query.with_entities(Flow.id)
+                .filter(_LIVE_FLOW_FILTER)
                 .filter(Flow.timestamp < cutoff)
                 .limit(batch_size)
                 .all()
@@ -734,13 +772,15 @@ def enforce_flow_retention() -> int:
             purged += delete_flow_batch(id_list)
 
     if FLOW_RETENTION_MAX_ROWS > 0:
-        total = Flow.query.count()
+        total = Flow.query.filter(_LIVE_FLOW_FILTER).count()
         if total > FLOW_RETENTION_MAX_ROWS:
             excess = total - FLOW_RETENTION_MAX_ROWS
             while excess > 0:
                 chunk = min(excess, batch_size)
                 oldest_ids = (
-                    Flow.query.order_by(Flow.timestamp.asc())
+                    Flow.query
+                    .filter(_LIVE_FLOW_FILTER)
+                    .order_by(Flow.timestamp.asc())
                     .with_entities(Flow.id)
                     .limit(chunk)
                     .all()
@@ -751,6 +791,32 @@ def enforce_flow_retention() -> int:
                 purged += delete_flow_batch(id_list)
                 excess -= len(id_list)
 
+    if purged:
+        db.session.commit()
+    return purged
+
+
+def enforce_batch_flow_retention() -> int:
+    if BATCH_FLOW_RETENTION_MINUTES <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=BATCH_FLOW_RETENTION_MINUTES)
+    batch_size = 1000
+    purged = 0
+    while True:
+        stale_ids = (
+            Flow.query
+            .filter(Flow.source == "batch")
+            .filter(Flow.timestamp < cutoff)
+            .with_entities(Flow.id)
+            .limit(batch_size)
+            .all()
+        )
+        id_list = [row.id for row in stale_ids]
+        if not id_list:
+            break
+        Prediction.query.filter(Prediction.flow_id.in_(id_list)).delete(synchronize_session=False)
+        Flow.query.filter(Flow.id.in_(id_list)).delete(synchronize_session=False)
+        purged += len(id_list)
     if purged:
         db.session.commit()
     return purged
@@ -1446,6 +1512,28 @@ def killswitch():
 # ---------------------------------------------------------------
 # Capture agent — interface enumeration and lifecycle management
 # ---------------------------------------------------------------
+def _get_windows_adapter_names() -> dict[str, str]:
+    """Return {GUID_upper: friendly_name} via Get-NetAdapter (Windows only)."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+             "Get-NetAdapter | Select-Object Name, InterfaceGuid | ConvertTo-Json"],
+            capture_output=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        data = json.loads(result.stdout.decode("utf-8", errors="replace"))
+        if isinstance(data, dict):
+            data = [data]
+        return {
+            str(item["InterfaceGuid"]).strip("{}").upper(): item["Name"]
+            for item in data
+            if item.get("InterfaceGuid") and item.get("Name")
+        }
+    except Exception:
+        return {}
+
+
 @app.get("/interfaces")
 def list_interfaces():
     tshark = _find_tshark()
@@ -1454,17 +1542,26 @@ def list_interfaces():
     try:
         result = subprocess.run(
             [tshark, "-D"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, timeout=5,
             cwd=os.path.dirname(os.path.abspath(tshark)),
             env=_tshark_env(tshark),
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
+        tshark_out = result.stdout.decode("utf-8", errors="replace")
+        win_names = _get_windows_adapter_names() if sys.platform == "win32" else {}
         interfaces = []
-        for line in result.stdout.strip().splitlines():
+        for line in tshark_out.strip().splitlines():
             m = re.match(r"(\d+)\.\s+(\S+)(?:\s+\((.+)\))?", line.strip())
-            if m:
-                idx, dev, name = int(m.group(1)), m.group(2), m.group(3) or m.group(2)
-                interfaces.append({"index": idx, "device": dev, "name": name})
+            if not m:
+                continue
+            idx = int(m.group(1))
+            dev = m.group(2)
+            name = m.group(3) or ""
+            if not name and win_names:
+                guid_m = re.search(r"\{([0-9A-Fa-f-]+)\}", dev)
+                if guid_m:
+                    name = win_names.get(guid_m.group(1).upper(), "")
+            interfaces.append({"index": idx, "device": dev, "name": name or dev})
         return jsonify(interfaces)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "tshark -D timed out", "interfaces": []}), 504
@@ -1497,6 +1594,175 @@ def agent_start():
 def agent_stop():
     _capture_agent.stop()
     return jsonify({"status": "stopped"})
+
+
+# ---------------------------------------------------------------
+# Batch analysis endpoints
+# ---------------------------------------------------------------
+
+BATCH_WINDOW_OPTIONS = {"10m": 10, "15m": 15, "1h": 60}
+BATCH_BUCKET_MINUTES = {10: 1, 15: 2, 60: 5}
+
+
+@app.route("/ingest_batch", methods=["POST"])
+def ingest_batch():
+    payload = request.get_json(force=True, silent=False)
+    if isinstance(payload, dict):
+        batch = [payload]
+    elif isinstance(payload, list):
+        batch = payload
+    else:
+        return jsonify({"error": "invalid payload"}), 400
+
+    blocked_set = {row.ip for row in BlockedIP.query.filter_by(active=True).all()}
+    flow_records: list[Flow] = []
+    blocked = 0
+
+    for rec in batch:
+        src_ip = rec.get("src_ip", "")
+        dst_ip = rec.get("dst_ip", "")
+        if src_ip in blocked_set or dst_ip in blocked_set:
+            blocked += 1
+            continue
+        flow = Flow(
+            timestamp=parse_timestamp(rec.get("ts")),
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            proto=normalize_protocol(rec.get("proto", "")),
+            bytes=int(rec.get("bytes") or 0),
+            extra=build_flow_extra(rec),
+            source="batch",
+        )
+        flow_records.append(flow)
+        db.session.add(flow)
+
+    try:
+        flow_ids: list[int] = []
+        if flow_records:
+            db.session.flush()
+            flow_ids = [f.id for f in flow_records]
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.exception("batch ingest failed: %s", exc)
+        return jsonify({"error": "database insert failed"}), 500
+
+    enforce_batch_flow_retention()
+
+    enqueued = 0
+    if flow_ids:
+        try:
+            enqueued = enqueue_flow_scoring(flow_ids)
+        except Exception as exc:
+            app.logger.exception("failed to enqueue batch flows for scoring: %s", exc)
+
+    return jsonify({"status": "ok", "ingested": len(flow_records), "blocked": blocked, "queued": enqueued})
+
+
+@app.get("/batch_summary")
+def batch_summary():
+    window_param = request.args.get("window", "10m")
+    window_minutes = BATCH_WINDOW_OPTIONS.get(window_param)
+    if window_minutes is None:
+        return jsonify({"error": f"window must be one of: {list(BATCH_WINDOW_OPTIONS)}"}), 400
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+
+    flows = (
+        Flow.query
+        .filter(Flow.source == "batch")
+        .filter(Flow.timestamp >= cutoff)
+        .order_by(Flow.timestamp.asc())
+        .all()
+    )
+
+    last_batch = (
+        Flow.query
+        .filter(Flow.source == "batch")
+        .order_by(Flow.timestamp.desc())
+        .first()
+    )
+    last_batch_ts = last_batch.timestamp.isoformat() if last_batch else None
+
+    if not flows:
+        return jsonify({
+            "window": window_param,
+            "window_minutes": window_minutes,
+            "total_flows": 0,
+            "total_bytes": 0,
+            "anomaly_count": 0,
+            "anomaly_rate": 0.0,
+            "proto_breakdown": {},
+            "top_src_ips": [],
+            "top_dst_ips": [],
+            "timeseries": [],
+            "last_batch_received": last_batch_ts,
+        })
+
+    flow_ids = [f.id for f in flows]
+    preds_by_flow = {
+        p.flow_id: p
+        for p in Prediction.query.filter(Prediction.flow_id.in_(flow_ids)).all()
+    }
+
+    total_bytes = sum(f.bytes or 0 for f in flows)
+    anomaly_count = 0
+    proto_counts: dict = {}
+    src_stats: dict = {}
+    dst_stats: dict = {}
+    bucket_mins = BATCH_BUCKET_MINUTES[window_minutes]
+    buckets: dict = {}
+
+    for f in flows:
+        pred = preds_by_flow.get(f.id)
+        if pred:
+            label = (pred.label or "").lower()
+            score = float(pred.score or 0)
+            if label not in {"normal"} or score >= 0.6:
+                anomaly_count += 1
+
+        proto = f.proto or "OTHER"
+        proto_counts[proto] = proto_counts.get(proto, 0) + 1
+
+        b = f.bytes or 0
+        src_stats.setdefault(f.src_ip, {"ip": f.src_ip, "flows": 0, "bytes": 0})
+        src_stats[f.src_ip]["flows"] += 1
+        src_stats[f.src_ip]["bytes"] += b
+
+        dst_stats.setdefault(f.dst_ip, {"ip": f.dst_ip, "flows": 0, "bytes": 0})
+        dst_stats[f.dst_ip]["flows"] += 1
+        dst_stats[f.dst_ip]["bytes"] += b
+
+        ts = f.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        bucket_key = int(ts.timestamp() // (bucket_mins * 60)) * (bucket_mins * 60)
+        if bucket_key not in buckets:
+            buckets[bucket_key] = {
+                "bucket": datetime.fromtimestamp(bucket_key, tz=timezone.utc).isoformat(),
+                "flows": 0, "bytes": 0, "anomaly_count": 0,
+            }
+        buckets[bucket_key]["flows"] += 1
+        buckets[bucket_key]["bytes"] += b
+        if pred:
+            label = (pred.label or "").lower()
+            score = float(pred.score or 0)
+            if label not in {"normal"} or score >= 0.6:
+                buckets[bucket_key]["anomaly_count"] += 1
+
+    return jsonify({
+        "window": window_param,
+        "window_minutes": window_minutes,
+        "total_flows": len(flows),
+        "total_bytes": total_bytes,
+        "anomaly_count": anomaly_count,
+        "anomaly_rate": round(anomaly_count / len(flows), 4),
+        "proto_breakdown": proto_counts,
+        "top_src_ips": sorted(src_stats.values(), key=lambda x: x["flows"], reverse=True)[:10],
+        "top_dst_ips": sorted(dst_stats.values(), key=lambda x: x["bytes"], reverse=True)[:10],
+        "timeseries": sorted(buckets.values(), key=lambda x: x["bucket"]),
+        "last_batch_received": last_batch_ts,
+    })
 
 
 # ---------------------------------------------------------------

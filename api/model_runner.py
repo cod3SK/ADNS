@@ -218,7 +218,8 @@ class MetaFeatureBuilder:
         row["src_pkts"] = max(0.0, src_pkts_extra) if src_pkts_extra is not None else self._estimate_packets(directional.src)
         row["dst_pkts"] = max(0.0, dst_pkts_extra) if dst_pkts_extra is not None else self._estimate_packets(directional.dst)
 
-        for field in ("src_port", "dst_port", "dns_qclass", "dns_qtype", "dns_rcode", "http_status_code"):
+        for field in ("src_port", "dst_port", "dns_qclass", "dns_qtype", "dns_rcode", "http_status_code",
+                      "dns_AA", "dns_RD", "dns_RA", "dns_rejected"):
             val = self._safe_int(extra.get(field))
             if val is not None:
                 row[field] = float(val)

@@ -49,8 +49,23 @@ const TABS = [
   { id: "dashboard", label: "Dashboard" },
   { id: "flows", label: "Flows" },
   { id: "flows-manager", label: "Flows Manager" },
+  { id: "batch", label: "Batch Analysis" },
   { id: "settings", label: "Settings" },
 ];
+
+const BATCH_WINDOWS = [
+  { key: "10m", label: "10 min" },
+  { key: "15m", label: "15 min" },
+  { key: "1h",  label: "1 hour" },
+];
+
+const formatBytes = (bytes) => {
+  if (!bytes) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+};
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
@@ -71,6 +86,9 @@ export default function App() {
   const [timezone, setTimezone] = useState(
     () => localStorage.getItem("adns_timezone") || Intl.DateTimeFormat().resolvedOptions().timeZone
   );
+  const [batchWindow, setBatchWindow] = useState("10m");
+  const [batchSummary, setBatchSummary] = useState(null);
+  const [batchLoading, setBatchLoading] = useState(true);
 
   const saveTimezone = (tz) => {
     setTimezone(tz);
@@ -186,11 +204,28 @@ export default function App() {
     }
   }, []);
 
+  const fetchBatchSummary = useCallback(async (win) => {
+    try {
+      const res = await api.get(`/api/batch_summary?window=${win || batchWindow}`);
+      setBatchSummary(res.data || null);
+    } catch {
+      /* silently degrade — batch agent may not be running */
+    } finally {
+      setBatchLoading(false);
+    }
+  }, [batchWindow]);
+
   useEffect(() => {
     fetchLatest();
     const id = setInterval(fetchLatest, 2000);
     return () => clearInterval(id);
   }, [fetchLatest]);
+
+  useEffect(() => {
+    fetchBatchSummary(batchWindow);
+    const id = setInterval(() => fetchBatchSummary(batchWindow), 15000);
+    return () => clearInterval(id);
+  }, [fetchBatchSummary, batchWindow]);
 
   useEffect(() => {
     const fetchKillSwitch = async () => {
@@ -684,6 +719,174 @@ export default function App() {
                   </ul>
                 )}
               </section>
+            </div>
+          )}
+
+          {/* ── Batch Analysis ── */}
+          {activeTab === "batch" && (
+            <div className="batch-layout">
+              <div className="batch-header-row">
+                <div className="window-selector">
+                  {BATCH_WINDOWS.map((w) => (
+                    <button
+                      key={w.key}
+                      type="button"
+                      className={`window-btn${batchWindow === w.key ? " window-btn-active" : ""}`}
+                      onClick={() => { setBatchWindow(w.key); fetchBatchSummary(w.key); }}
+                    >
+                      {w.label}
+                    </button>
+                  ))}
+                </div>
+                <span className="batch-status">
+                  {batchSummary?.last_batch_received
+                    ? `Last batch: ${formatRelativeTime(batchSummary.last_batch_received)}`
+                    : "No batch data — start batch_capture.py agent"}
+                </span>
+              </div>
+
+              {batchLoading ? (
+                <p className="empty-state">Loading batch data…</p>
+              ) : !batchSummary || batchSummary.total_flows === 0 ? (
+                <p className="empty-state">
+                  No batch flows in the last {batchWindow} window. Run <code>agent/batch_capture.py</code> to begin.
+                </p>
+              ) : (
+                <>
+                  <div className="metrics-row">
+                    <Card title="Flows captured" value={batchSummary.total_flows.toLocaleString()} />
+                    <Card title="Total bytes" value={formatBytes(batchSummary.total_bytes)} />
+                    <Card
+                      title="Anomaly rate"
+                      value={`${(batchSummary.anomaly_rate * 100).toFixed(1)}%`}
+                    />
+                    <Card title="Anomalies" value={batchSummary.anomaly_count} />
+                  </div>
+
+                  <div className="charts-grid">
+                    <section className="panel chart-panel" style={{ gridColumn: "span 2" }}>
+                      <div className="panel-heading">
+                        <h3>Traffic over time</h3>
+                        <p>Flow count and anomalies per bucket.</p>
+                      </div>
+                      {batchSummary.timeseries.length === 0 ? (
+                        <p className="empty-state">No time-series data yet.</p>
+                      ) : (
+                        <ResponsiveContainer width="100%" height="100%">
+                          <AreaChart data={batchSummary.timeseries.map((b) => ({
+                            ...b,
+                            label: new Date(b.bucket).toLocaleTimeString([], {
+                              timeZone: timezone,
+                              hour12: false,
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            }),
+                          }))}>
+                            <defs>
+                              <linearGradient id="batchFlowGrad" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.5} />
+                                <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.05} />
+                              </linearGradient>
+                              <linearGradient id="batchAnomalyGrad" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="0%" stopColor="#ef4444" stopOpacity={0.6} />
+                                <stop offset="100%" stopColor="#ef4444" stopOpacity={0.05} />
+                              </linearGradient>
+                            </defs>
+                            <CartesianGrid strokeDasharray="2 4" vertical={false} />
+                            <XAxis dataKey="label" tick={{ fontSize: 10 }} />
+                            <YAxis />
+                            <Tooltip />
+                            <Area type="monotone" dataKey="flows" name="Flows"
+                              stroke="#3b82f6" fill="url(#batchFlowGrad)"
+                              strokeWidth={2} dot={false} isAnimationActive={false} />
+                            <Area type="monotone" dataKey="anomaly_count" name="Anomalies"
+                              stroke="#ef4444" fill="url(#batchAnomalyGrad)"
+                              strokeWidth={2} dot={false} isAnimationActive={false} />
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      )}
+                    </section>
+
+                    <section className="panel donut-panel">
+                      <div className="panel-heading">
+                        <h3>Protocol mix</h3>
+                        <p>Flow count by protocol.</p>
+                      </div>
+                      {Object.keys(batchSummary.proto_breakdown).length === 0 ? (
+                        <p className="empty-state">No protocol data.</p>
+                      ) : (
+                        <div className="donut-wrapper">
+                          <ResponsiveContainer width="55%" height={220}>
+                            <PieChart>
+                              <Pie
+                                data={Object.entries(batchSummary.proto_breakdown).map(([name, value]) => ({ name, value }))}
+                                innerRadius={60} outerRadius={90}
+                                dataKey="value" paddingAngle={2}
+                                isAnimationActive={false}
+                              >
+                                {Object.keys(batchSummary.proto_breakdown).map((proto, i) => (
+                                  <Cell key={proto} fill={["#3b82f6","#22c55e","#f59e0b","#8b5cf6","#ef4444"][i % 5]} />
+                                ))}
+                              </Pie>
+                              <Tooltip formatter={(v, n) => [`${v} flows`, n]} />
+                            </PieChart>
+                          </ResponsiveContainer>
+                          <ul className="donut-legend">
+                            {Object.entries(batchSummary.proto_breakdown).map(([proto, count], i) => (
+                              <li key={proto}>
+                                <span className="dot" style={{ background: ["#3b82f6","#22c55e","#f59e0b","#8b5cf6","#ef4444"][i % 5] }} />
+                                {proto}: {count}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </section>
+
+                    <section className="panel">
+                      <div className="panel-heading">
+                        <h3>Top source IPs</h3>
+                        <p>By flow count.</p>
+                      </div>
+                      <div className="table-wrapper">
+                        <table className="flow-table">
+                          <thead><tr><Th>IP</Th><Th>Flows</Th><Th>Bytes</Th></tr></thead>
+                          <tbody>
+                            {batchSummary.top_src_ips.map((row) => (
+                              <tr key={row.ip}>
+                                <Td>{row.ip}</Td>
+                                <Td>{row.flows.toLocaleString()}</Td>
+                                <Td>{formatBytes(row.bytes)}</Td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+
+                    <section className="panel">
+                      <div className="panel-heading">
+                        <h3>Top destination IPs</h3>
+                        <p>By bytes transferred.</p>
+                      </div>
+                      <div className="table-wrapper">
+                        <table className="flow-table">
+                          <thead><tr><Th>IP</Th><Th>Flows</Th><Th>Bytes</Th></tr></thead>
+                          <tbody>
+                            {batchSummary.top_dst_ips.map((row) => (
+                              <tr key={row.ip}>
+                                <Td>{row.ip}</Td>
+                                <Td>{row.flows.toLocaleString()}</Td>
+                                <Td>{formatBytes(row.bytes)}</Td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+                  </div>
+                </>
+              )}
             </div>
           )}
 

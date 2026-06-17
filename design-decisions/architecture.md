@@ -12,43 +12,51 @@ this file describes the result.
 ```
                           ┌─────────────────────────────────────────────┐
                           │  Network interface (eth0 / INTERFACE)        │
-                          └─────────────────┬───────────────────────────┘
-                                            │ raw packets (real-time)
-                                            ▼
+                          └──────────┬──────────────────────────────────┘
+                                     │ raw packets
+                          ┌──────────┴──────────────────────────────────┐
+                          │                                              │
+                          ▼  per-packet (real-time)                     ▼  ring-buffer pcaps
+┌──────────────────────────────────┐          ┌──────────────────────────────────────────────┐
+│  agent/capture.py                │          │  agent/batch_capture.py                      │
+│                                  │          │                                              │
+│  tshark line-buffered; each line │          │  tshark -b duration:N -b files:M writes      │
+│  = one packet. 20 fields parsed. │          │  rotating pcaps. When a file is complete     │
+│  Normalized into flow dicts,     │          │  (not the newest by mtime), runs two passes: │
+│  buffered.                       │          │    Pass 1: -z conv,tcp/udp → real duration,  │
+│                                  │          │      directional bytes + packet counts        │
+│  Flush triggers:                 │          │    Pass 2: -T fields → app-layer dissection  │
+│    • BATCH_SIZE packets (50)     │          │  Merges on bidirectional 4-tuple. Deletes     │
+│    • POST_INTERVAL elapsed (2 s) │          │  processed pcap. Polls every 2 s.            │
+│                                  │          │                                              │
+│  On flush: POST to /ingest.      │          │  On merge: POST to /ingest_batch.            │
+│  On failure: retry after         │          │  Env: INTERFACE, BATCH_WINDOW_SECONDS (15),  │
+│    RETRY_DELAY (3.0 s).          │          │    BATCH_DIR, BATCH_API_URL, TSHARK_BIN      │
+└─────────────┬────────────────────┘          └──────────────────────┬───────────────────────┘
+              │ JSON array, up to BATCH_SIZE flows                   │ JSON array of merged flows
+              │ POST /ingest  (local HTTP)                           │ POST /ingest_batch
+              ▼                                                       ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  agent/capture.py  —  tshark wrapper                                  │
+│  api/app.py  —  Flask  POST /ingest  /  POST /ingest_batch            │
 │                                                                       │
-│  tshark runs line-buffered (bufsize=1); each line = one packet.       │
-│  Fields parsed: 20 columns (timestamps, IPs, proto, ports, DNS,       │
-│  HTTP, SSL).  Packets are normalized into flow dicts and buffered.    │
-│                                                                       │
-│  Flush triggers (whichever fires first):                              │
-│    • BATCH_SIZE packets in buffer   (default 50)                      │
-│    • POST_INTERVAL seconds elapsed  (default 2.0 s)                   │
-│                                                                       │
-│  On flush: HTTP POST to /ingest, timeout 5 s.                         │
-│  On failure: keep buffer, sleep RETRY_DELAY (default 3.0 s), retry.  │
-└───────────────────────────────┬───────────────────────────────────────┘
-                                │ JSON array, up to BATCH_SIZE flows
-                                │ POST /ingest  (local HTTP)
-                                ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│  api/app.py  —  Flask  POST /ingest                                   │
-│                                                                       │
+│  /ingest:                                                             │
 │  1. Read blocked-IP set from DB (one SELECT at request start).        │
 │  2. For each flow record:                                             │
 │       • skip if src_ip or dst_ip is in blocked set                    │
-│       • build Flow ORM object + build_flow_extra() for JSON column    │
-│  3. db.session.flush()  →  assigns DB IDs without committing          │
-│  4. db.session.commit()  →  flows are durable                        │
-│  5. enforce_flow_retention():                                         │
+│       • build Flow ORM object, source='live'                          │
+│  3. db.session.flush() → assigns DB IDs                              │
+│  4. db.session.commit() → flows are durable                          │
+│  5. enforce_flow_retention() (live flows only):                       │
 │       • delete flows older than ADNS_FLOW_RETENTION_MINUTES (30 min) │
 │       • trim to ADNS_FLOW_RETENTION_MAX_ROWS (5 000) if exceeded      │
-│       • deletion runs in batches of 1 000 rows per loop iteration     │
-│  6. enqueue_flow_scoring(flow_ids)  →  see thread pool below          │
+│  6. enqueue_flow_scoring(flow_ids) → see thread pool below            │
 │                                                                       │
-│  Response: {"status":"ok","ingested":N,"blocked":B,                   │
-│             "purged":P,"queued":Q}                                    │
+│  /ingest_batch:                                                       │
+│  1. Writes flows with source='batch'.                                 │
+│  2. enforce_batch_flow_retention() (batch flows only, 65-min window). │
+│  3. enqueue_flow_scoring(flow_ids) → same scoring path.              │
+│                                                                       │
+│  Response: {"status":"ok","ingested":N,...}                           │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │ list of Flow.id integers
                                 ▼
@@ -108,12 +116,18 @@ this file describes the result.
 ┌───────────────────────────────────────────────────────────────────────┐
 │  frontend/adns-frontend/src/App.jsx  —  React dashboard               │
 │                                                                       │
-│  setInterval(fetchLatest, 2000)  — fires every 2 s                   │
-│  Each tick issues four parallel GET requests:                         │
-│    GET /api/flows          → last MAX_FLOWS=400 flows, oldest-first   │
-│    GET /api/anomalies      → aggregate stats over the same buffer     │
-│    GET /api/anomalous_flows → flows where label ≠ normal or score≥0.6│
-│    GET /api/blocked_ips    → active blocked-IP records                │
+│  Live data: setInterval(fetchLatest, 2000) — fires every 2 s          │
+│    GET /api/flows           → last MAX_FLOWS=400 live flows            │
+│    GET /api/anomalies       → aggregate stats over live buffer         │
+│    GET /api/anomalous_flows → live flows where label≠normal/score≥0.6 │
+│    GET /api/blocked_ips     → active blocked-IP records                │
+│                                                                       │
+│  Batch Analysis tab: setInterval(fetchBatchSummary, 15000)            │
+│    GET /api/batch_summary?window=10m|15m|1h                           │
+│      → total_flows, total_bytes, anomaly_count, anomaly_rate,         │
+│         proto_breakdown, top_src_ips (by flows),                      │
+│         top_dst_ips (by bytes), bucketed timeseries,                  │
+│         last_batch_received                                           │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -173,10 +187,16 @@ accumulates at each step before it is visible on the dashboard.
 
 | Variable | Default | Stage |
 |---|---|---|
-| `BATCH_SIZE` | 50 | Capture |
-| `POST_INTERVAL` | 2.0 s | Capture |
-| `RETRY_DELAY` | 3.0 s | Capture |
-| `API_URL` | http://127.0.0.1:5000/ingest | Capture |
+| `BATCH_SIZE` | 50 | Live capture |
+| `POST_INTERVAL` | 2.0 s | Live capture |
+| `RETRY_DELAY` | 3.0 s | Live capture |
+| `API_URL` | http://127.0.0.1:5000/ingest | Live capture |
+| `INTERFACE` | eth0 | Both capture agents |
+| `TSHARK_BIN` | *(auto-detected)* | Both capture agents |
+| `BATCH_WINDOW_SECONDS` | 15 | Batch capture |
+| `BATCH_DIR` | *(system temp)* | Batch capture |
+| `BATCH_API_URL` | http://127.0.0.1:5000/ingest_batch | Batch capture |
+| `ADNS_BATCH_FLOW_RETENTION_MINUTES` | 65 | Ingest (batch) |
 | `ADNS_SCORER_WORKERS` | 2 | Thread pool |
 | `ADNS_SCORING_BATCH_SIZE` | 100 | Thread pool |
 | `ADNS_SCORING_FETCH_CHUNK` | 256 | Scoring |
@@ -186,8 +206,8 @@ accumulates at each step before it is visible on the dashboard.
 | `ADNS_RDNS_CACHE_TTL` | 900 s | Scoring |
 | `ADNS_META_ANOMALY_THRESHOLD` | 0.82 | Detection |
 | `ADNS_META_WATCH_THRESHOLD` | 0.60 | Detection |
-| `ADNS_FLOW_RETENTION_MINUTES` | 30 | Ingest |
-| `ADNS_FLOW_RETENTION_MAX_ROWS` | 5 000 | Ingest |
+| `ADNS_FLOW_RETENTION_MINUTES` | 30 | Ingest (live) |
+| `ADNS_FLOW_RETENTION_MAX_ROWS` | 5 000 | Ingest (live) |
 | `ADNS_ADMIN_TOKEN` | *(unset)* | block_ip / unblock_ip (killswitch is not gated) |
 | `SQLALCHEMY_DATABASE_URI` | postgresql://adns:adns_password@127.0.0.1/adns | API |
 

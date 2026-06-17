@@ -13,7 +13,7 @@ import pytest
 
 def _make_run_result(stdout="", returncode=0):
     r = MagicMock(spec=subprocess.CompletedProcess)
-    r.stdout = stdout
+    r.stdout = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
     r.returncode = returncode
     return r
 
