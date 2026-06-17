@@ -35,10 +35,15 @@ sklearn_datas, sklearn_binaries, sklearn_hiddenimports = collect_all("sklearn")
 webview_datas, webview_binaries, webview_hiddenimports = collect_all("webview")
 pystray_datas, pystray_binaries, pystray_hiddenimports = collect_all("pystray")
 
+# collect_all("xgboost") misses the native DLL — add it explicitly.
+import xgboost as _xgb
+_xgb_lib = os.path.join(os.path.dirname(_xgb.__file__), "lib", "xgboost.dll")
+_xgboost_binaries = [(_xgb_lib, "xgboost/lib")] if os.path.isfile(_xgb_lib) else []
+
 a = Analysis(
     ["launcher.py"],
     pathex=["api"],          # so 'from app import ...' resolves
-    binaries=sklearn_binaries + webview_binaries + pystray_binaries,
+    binaries=sklearn_binaries + webview_binaries + pystray_binaries + _xgboost_binaries,
     datas=[
         # React production build
         ("frontend/adns-frontend/dist", "dist"),
