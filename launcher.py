@@ -53,37 +53,46 @@ class _StripApiPrefix:
 
 
 _flask_server = None
+_flask_start_error: str | None = None
 
 
 def _start_flask(data_dir: str) -> None:
-    global _flask_server
-    api_dir = resource_path("api")
-    if api_dir not in sys.path:
-        sys.path.insert(0, api_dir)
+    global _flask_server, _flask_start_error
+    try:
+        api_dir = resource_path("api")
+        if api_dir not in sys.path:
+            sys.path.insert(0, api_dir)
 
-    # SQLite stored in user's AppData so it survives re-installs
-    os.environ.setdefault(
-        "SQLALCHEMY_DATABASE_URI",
-        "sqlite:///{}".format(os.path.join(data_dir, "adns.db")),
-    )
-    os.environ.setdefault("ADNS_RDNS_ENABLED", "false")
-    # Point Flask's static-serving route at the bundled React build
-    os.environ["ADNS_FRONTEND_DIST"] = resource_path("dist")
+        # SQLite stored in user's AppData so it survives re-installs
+        os.environ.setdefault(
+            "SQLALCHEMY_DATABASE_URI",
+            "sqlite:///{}".format(os.path.join(data_dir, "adns.db")),
+        )
+        os.environ.setdefault("ADNS_RDNS_ENABLED", "false")
+        # Point Flask's static-serving route at the bundled React build
+        os.environ["ADNS_FRONTEND_DIST"] = resource_path("dist")
 
-    from app import app  # noqa: PLC0415  (deferred so env vars are set first)
+        from app import app  # noqa: PLC0415  (deferred so env vars are set first)
 
-    app.wsgi_app = _StripApiPrefix(app.wsgi_app)
+        app.wsgi_app = _StripApiPrefix(app.wsgi_app)
 
-    from werkzeug.serving import make_server  # noqa: PLC0415
-    server = make_server("127.0.0.1", 5000, app, threaded=True)
-    _flask_server = server
-    server.serve_forever()
-    server.server_close()  # release the socket so the port is immediately reusable
+        from werkzeug.serving import make_server  # noqa: PLC0415
+        server = make_server("127.0.0.1", 5000, app, threaded=True)
+        _flask_server = server
+        server.serve_forever()
+        server.server_close()  # release the socket so the port is immediately reusable
+    except Exception:
+        import traceback
+        _flask_start_error = traceback.format_exc()
 
 
-def _wait_for_api(url: str, timeout: float = 15.0) -> bool:
+def _wait_for_api(url: str, timeout: float = 30.0,
+                  thread: threading.Thread | None = None) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # If the Flask thread died we'll never get a response — stop waiting.
+        if thread is not None and not thread.is_alive():
+            return False
         try:
             urllib.request.urlopen(url, timeout=1)
             return True
@@ -242,12 +251,14 @@ def main() -> None:
     t = threading.Thread(target=_start_flask, args=(data_dir,), daemon=True)
     t.start()
 
-    if not _wait_for_api("http://127.0.0.1:5000/health"):
-        _fatal(
-            "ADNS failed to start.\n\n"
-            "Port 5000 may already be in use.\n"
-            "Check Task Manager and close anything running on port 5000."
-        )
+    if not _wait_for_api("http://127.0.0.1:5000/health", thread=t):
+        if _flask_start_error:
+            _fatal(f"ADNS failed to start.\n\n{_flask_start_error}")
+        else:
+            _fatal(
+                "ADNS failed to start within 30 seconds.\n\n"
+                "Port 5000 may be in use. Open Task Manager, close anything on port 5000, then try again."
+            )
 
     # Flask is up — auto-start both capture agents on the detected interface.
     try:
