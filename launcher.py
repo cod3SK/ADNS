@@ -206,13 +206,27 @@ def main() -> None:
             "Check Task Manager and close anything running on port 5000."
         )
 
-    # Flask is up — app module is imported. Register cleanup so tshark
-    # (a child subprocess) is terminated on exit; Windows does not auto-kill
-    # child processes when the parent exits.
+    # Flask is up — auto-start both capture agents on the detected interface.
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                "http://127.0.0.1:5000/capture/autostart",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=10,
+        )
+    except Exception:
+        pass  # app starts fine even if capture can't start (e.g. no tshark)
+
+    # Register cleanup so tshark subprocesses are terminated on exit.
+    # Windows does not auto-kill child processes when the parent exits.
     def _stop_capture():
         try:
-            from app import _capture_agent  # noqa: PLC0415
+            from app import _capture_agent, _batch_capture_agent  # noqa: PLC0415
             _capture_agent.stop()
+            _batch_capture_agent.stop()
         except Exception:
             pass
 

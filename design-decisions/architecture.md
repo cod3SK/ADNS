@@ -51,7 +51,7 @@ this file describes the result.
 │       • trim to ADNS_FLOW_RETENTION_MAX_ROWS (5 000) if exceeded      │
 │  6. enqueue_flow_scoring(flow_ids) → see thread pool below            │
 │                                                                       │
-│  /ingest_batch:                                                       │
+│  /ingest_batch (HTTP endpoint + _BatchCaptureAgent._ingest):          │
 │  1. Writes flows with source='batch'.                                 │
 │  2. enforce_batch_flow_retention() (batch flows only, 65-min window). │
 │  3. enqueue_flow_scoring(flow_ids) → same scoring path.              │
@@ -96,16 +96,12 @@ this file describes the result.
 ┌───────────────────────────────────────────────────────────────────────┐
 │  api/model_runner.py  —  DetectionEngine                              │
 │                                                                       │
-│  Cascade (loads first available, falls through on FileNotFoundError): │
-│    1. meta   — MetaEnsembleModel: ExtraTrees + XGBoost averaged       │
-│                artifact: model_artifacts/meta_model_combined.joblib   │
-│                anomaly threshold: ADNS_META_ANOMALY_THRESHOLD (0.82)  │
-│                watch   threshold: ADNS_META_WATCH_THRESHOLD   (0.60)  │
-│    2. ml     — FlowModel: calibrated sklearn pipeline                 │
-│                artifact: model_artifacts/flow_detector.joblib         │
-│                anomaly threshold from artifact (default 0.6)          │
-│    3. heuristic — FlowScorer: bytes + burst + direction + proto rules │
-│                no artifact required; always available                 │
+│  Single model (MetaEnsembleModel):                                    │
+│    ExtraTrees + XGBoost averaged                                      │
+│    artifact: model_artifacts/meta_model_combined.joblib               │
+│    anomaly threshold: ADNS_META_ANOMALY_THRESHOLD (0.82)              │
+│    watch   threshold: ADNS_META_WATCH_THRESHOLD   (0.60)              │
+│    Returns (0.0, "normal") when artifact is absent (dev/test).        │
 │                                                                       │
 │  predict_many() processes the entire chunk as a single DataFrame      │
 │  inference call (meta/ml) or sequential predict() calls (heuristic). │
@@ -122,12 +118,15 @@ this file describes the result.
 │    GET /api/anomalous_flows → live flows where label≠normal/score≥0.6 │
 │    GET /api/blocked_ips     → active blocked-IP records                │
 │                                                                       │
+│  Capture status: setInterval(fetchCaptureStatus, 3000)                │
+│    GET /api/capture_status → interface name, tshark found,            │
+│      live (running/flows/last ingest/uptime/error),                   │
+│      batch (running/batches/last batch/uptime/error)                  │
+│                                                                       │
 │  Batch Analysis tab: setInterval(fetchBatchSummary, 15000)            │
 │    GET /api/batch_summary?window=10m|15m|1h                           │
 │      → total_flows, total_bytes, anomaly_count, anomaly_rate,         │
-│         proto_breakdown, top_src_ips (by flows),                      │
-│         top_dst_ips (by bytes), bucketed timeseries,                  │
-│         last_batch_received                                           │
+│         proto_breakdown, top_src_ips, top_dst_ips, timeseries         │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 

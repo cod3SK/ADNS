@@ -1112,6 +1112,421 @@ class _CaptureAgent:
 _capture_agent = _CaptureAgent()
 
 
+# ---------------------------------------------------------------
+# Batch capture agent — ring-buffer tshark + two-pass pcap processing
+# ---------------------------------------------------------------
+
+_BATCH_CONV_RE = re.compile(
+    r"(\S+):(\d+)\s+<->\s+(\S+):(\d+)\s*"
+    r"\|\s*(\d+)\s+(\d+)\s*\|\s*"
+    r"\|\s*(\d+)\s+(\d+)\s*\|\s*"
+    r"\|\s*\d+\s+\d+\s*\|"
+    r"\s*([\d.]+)\s*\|\s*([\d.]+)"
+)
+
+_BATCH_PASS2_FIELDS = [
+    "frame.time_epoch", "ip.src", "ip.dst", "ip.proto",
+    "tcp.srcport", "tcp.dstport", "udp.srcport", "udp.dstport",
+    "dns.qry.name", "dns.qry.type", "dns.qry.class", "dns.flags.rcode",
+    "dns.flags.authoritative", "dns.flags.recdesired", "dns.flags.recavail",
+    "http.request.method", "http.request.full_uri", "http.user_agent",
+    "http.response.code", "http.content_length",
+    "http.referer", "http.request.version", "http.content_type",
+    "ssl.handshake.version", "ssl.handshake.ciphersuite",
+]
+
+_BATCH_WINDOW_SECONDS = 15
+_BATCH_MAX_FILES = 4
+
+_BATCH_PROTO_MAP = {
+    "1": "ICMP", "6": "TCP", "17": "UDP",
+    "47": "GRE", "50": "ESP", "51": "AH", "58": "ICMPV6", "132": "SCTP",
+}
+_BATCH_SERVICE_PORTS = {
+    20: "ftp", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp",
+    53: "dns", 67: "dhcp", 68: "dhcp", 80: "http", 110: "pop3",
+    123: "ntp", 143: "imap", 443: "https", 445: "smb", 3389: "rdp",
+}
+
+
+class _BatchCaptureAgent:
+    """Runs tshark in ring-buffer mode and processes completed pcaps in-process."""
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._interface: str | None = None
+        self._tshark_bin: str | None = None
+        self._batch_dir: str | None = None
+        self._start_time: float | None = None
+        self._batches_processed = 0
+        self._last_batch: datetime | None = None
+        self._last_error: str | None = None
+        self._stop_evt = threading.Event()
+        self.running = False
+
+    def start(self, interface: str, tshark_bin: str) -> None:
+        import shutil as _shutil
+        import tempfile as _tempfile
+        with self._lock:
+            self._stop_internal()
+            self._stop_evt.clear()
+            self._interface = interface
+            self._tshark_bin = tshark_bin
+            self._batches_processed = 0
+            self._last_batch = None
+            self._last_error = None
+            self._start_time = time.time()
+            self._batch_dir = _tempfile.mkdtemp(prefix="adns_batch_")
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_internal()
+
+    def _stop_internal(self) -> None:
+        import shutil as _shutil
+        self._stop_evt.set()
+        self.running = False
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = None
+        if self._batch_dir and os.path.isdir(self._batch_dir):
+            _shutil.rmtree(self._batch_dir, ignore_errors=True)
+        self._batch_dir = None
+        self._start_time = None
+
+    def status(self) -> dict:
+        uptime = round(time.time() - self._start_time, 1) if self._start_time and self.running else None
+        return {
+            "running": self.running,
+            "interface": self._interface,
+            "batches_processed": self._batches_processed,
+            "last_batch": self._last_batch.isoformat() if self._last_batch else None,
+            "uptime_seconds": uptime,
+            "last_error": self._last_error,
+        }
+
+    def _run_loop(self) -> None:
+        import glob as _glob
+        batch_dir = self._batch_dir
+        tshark_bin = self._tshark_bin
+        pcap_base = os.path.join(batch_dir, "cap")
+        cmd = [
+            tshark_bin, "-i", self._interface,
+            "-b", f"duration:{_BATCH_WINDOW_SECONDS}",
+            "-b", f"files:{_BATCH_MAX_FILES}",
+            "-w", pcap_base, "-q",
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd=os.path.dirname(os.path.abspath(tshark_bin)),
+                env=_tshark_env(tshark_bin),
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            self.running = True
+        except Exception as exc:
+            self._last_error = str(exc)
+            return
+
+        processed: set = set()
+        while not self._stop_evt.is_set():
+            if self._proc.poll() is not None:
+                if not self._stop_evt.is_set():
+                    self._last_error = f"tshark ring-buffer exited (code {self._proc.returncode})"
+                self.running = False
+                break
+            try:
+                pcaps = sorted(
+                    _glob.glob(os.path.join(batch_dir, "cap_*.pcap")),
+                    key=os.path.getmtime,
+                )
+                for pcap_path in pcaps[:-1] if len(pcaps) > 1 else []:
+                    if pcap_path in processed:
+                        continue
+                    try:
+                        flows = self._process_pcap(pcap_path, tshark_bin)
+                        if flows:
+                            self._ingest(flows)
+                            self._batches_processed += 1
+                            self._last_batch = datetime.utcnow()
+                        processed.add(pcap_path)
+                        try:
+                            os.unlink(pcap_path)
+                            processed.discard(pcap_path)
+                        except OSError:
+                            pass
+                    except Exception as exc:
+                        self._last_error = str(exc)
+                        app.logger.exception("batch pcap processing failed: %s", exc)
+            except Exception as exc:
+                self._last_error = str(exc)
+            self._stop_evt.wait(2.0)
+        self.running = False
+
+    def _process_pcap(self, pcap: str, tshark_bin: str) -> list[dict]:
+        conv_flows = self._run_conv_stats(pcap, tshark_bin)
+        if not conv_flows:
+            return []
+        packets = self._run_field_pass(pcap, tshark_bin)
+        app_index = self._build_app_index(packets)
+        return self._merge_flows(conv_flows, app_index, os.path.getmtime(pcap))
+
+    def _run_conv_stats(self, pcap: str, tshark_bin: str) -> list[dict]:
+        try:
+            result = subprocess.run(
+                [tshark_bin, "-r", pcap, "-q", "-z", "conv,tcp", "-z", "conv,udp"],
+                capture_output=True, timeout=60,
+                cwd=os.path.dirname(os.path.abspath(tshark_bin)),
+                env=_tshark_env(tshark_bin),
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except Exception as exc:
+            app.logger.warning("conv stats failed: %s", exc)
+            return []
+        flows, current_proto = [], "TCP"
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            if "TCP Conversations" in line:
+                current_proto = "TCP"
+            elif "UDP Conversations" in line:
+                current_proto = "UDP"
+            m = _BATCH_CONV_RE.search(line)
+            if not m:
+                continue
+            a_ip, a_port, b_ip, b_port, frames_ba, bytes_ba, frames_ab, bytes_ab, rel_start, duration = m.groups()
+            flows.append({
+                "proto": current_proto,
+                "src_ip": a_ip, "src_port": int(a_port),
+                "dst_ip": b_ip, "dst_port": int(b_port),
+                "src_bytes": int(bytes_ab), "dst_bytes": int(bytes_ba),
+                "src_pkts": int(frames_ab), "dst_pkts": int(frames_ba),
+                "duration": float(duration), "rel_start": float(rel_start),
+            })
+        return flows
+
+    def _run_field_pass(self, pcap: str, tshark_bin: str) -> list[dict]:
+        cmd = [tshark_bin, "-r", pcap, "-T", "fields", "-Y", "ip"]
+        for field in _BATCH_PASS2_FIELDS:
+            cmd.extend(["-e", field])
+        cmd.extend(["-E", "separator=\t", "-E", "header=n"])
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, timeout=120,
+                cwd=os.path.dirname(os.path.abspath(tshark_bin)),
+                env=_tshark_env(tshark_bin),
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except Exception as exc:
+            app.logger.warning("field pass failed: %s", exc)
+            return []
+        n = len(_BATCH_PASS2_FIELDS)
+        packets = []
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            parts = line.split("\t")
+            if len(parts) < n:
+                parts += [""] * (n - len(parts))
+            src_ip, dst_ip = parts[1].strip(), parts[2].strip()
+            if not src_ip or not dst_ip:
+                continue
+            pv = parts[3].strip()
+            proto = _BATCH_PROTO_MAP.get(pv, pv.upper() if pv else "OTHER")
+
+            def _si(v):
+                try: return int(v.strip()) if v.strip() else None
+                except (ValueError, AttributeError): return None
+
+            pkt = {
+                "ts": parts[0].strip(), "src_ip": src_ip, "dst_ip": dst_ip, "proto": proto,
+                "src_port": _si(parts[4]) or _si(parts[6]),
+                "dst_port": _si(parts[5]) or _si(parts[7]),
+            }
+            for key, raw in [
+                ("dns_query", parts[8]), ("dns_qtype", _si(parts[9])),
+                ("dns_qclass", _si(parts[10])), ("dns_rcode", _si(parts[11])),
+                ("dns_AA", _si(parts[12])), ("dns_RD", _si(parts[13])), ("dns_RA", _si(parts[14])),
+                ("http_method", parts[15]), ("http_uri", parts[16]),
+                ("http_user_agent", parts[17]), ("http_status_code", _si(parts[18])),
+                ("http_content_length", _si(parts[19])), ("http_referrer", parts[20]),
+                ("http_version", parts[21]), ("http_content_type", parts[22]),
+                ("ssl_version", _si(parts[23])), ("ssl_cipher", parts[24]),
+            ]:
+                val = raw.strip() if isinstance(raw, str) else raw
+                if val is not None and val != "":
+                    pkt[key] = val
+            packets.append(pkt)
+        return packets
+
+    @staticmethod
+    def _build_app_index(packets: list[dict]) -> dict:
+        index: dict = {}
+        skip = {"ts", "src_ip", "dst_ip", "proto", "src_port", "dst_port"}
+        for pkt in packets:
+            s = (pkt.get("src_ip", ""), pkt.get("src_port") or 0)
+            d = (pkt.get("dst_ip", ""), pkt.get("dst_port") or 0)
+            for key in ((s[0], s[1], d[0], d[1]), (d[0], d[1], s[0], s[1])):
+                if key not in index:
+                    index[key] = {}
+                for k, v in pkt.items():
+                    if k in skip or v is None or v == "":
+                        continue
+                    index[key].setdefault(k, v)
+        return index
+
+    def _merge_flows(self, conv_flows: list[dict], app_index: dict, pcap_mtime: float) -> list[dict]:
+        result = []
+        for flow in conv_flows:
+            key = (flow["src_ip"], flow["src_port"], flow["dst_ip"], flow["dst_port"])
+            app_data = app_index.get(key, {})
+            total_bytes = flow["src_bytes"] + flow["dst_bytes"]
+            rec = {
+                "ts": pcap_mtime - _BATCH_WINDOW_SECONDS + flow["rel_start"],
+                "src_ip": flow["src_ip"], "dst_ip": flow["dst_ip"],
+                "proto": flow["proto"], "bytes": total_bytes,
+                "src_bytes": flow["src_bytes"], "dst_bytes": flow["dst_bytes"],
+                "src_pkts": flow["src_pkts"], "dst_pkts": flow["dst_pkts"],
+                "duration": flow["duration"],
+                "src_port": flow["src_port"], "dst_port": flow["dst_port"],
+            }
+            for k, v in app_data.items():
+                rec.setdefault(k, v)
+            rec["service"] = self._infer_service(
+                flow["proto"], flow["src_port"], flow["dst_port"],
+                app_data.get("dns_query"), app_data.get("http_method"), app_data.get("ssl_version"),
+            )
+            ct = app_data.get("http_content_type", "")
+            if ct:
+                if app_data.get("http_method"):
+                    rec.setdefault("http_orig_mime_types", ct)
+                elif app_data.get("http_status_code"):
+                    rec.setdefault("http_resp_mime_types", ct)
+            dns_rcode = app_data.get("dns_rcode")
+            if dns_rcode is not None:
+                rec.setdefault("dns_rejected", 1 if dns_rcode != 0 else 0)
+            result.append(rec)
+        return result
+
+    @staticmethod
+    def _infer_service(proto, src_port, dst_port, dns_query, http_method, ssl_version) -> str:
+        if http_method:
+            return "http"
+        if ssl_version is not None or dst_port in {443, 8443}:
+            return "https"
+        if dns_query or dst_port == 53:
+            return "dns"
+        port = dst_port or src_port
+        return _BATCH_SERVICE_PORTS.get(port, (proto or "other").lower()) if port else (proto or "other").lower()
+
+    def _ingest(self, flows: list[dict]) -> None:
+        with app.app_context():
+            blocked_set = {r.ip for r in BlockedIP.query.filter_by(active=True).all()}
+            flow_records: list[Flow] = []
+            for rec in flows:
+                src_ip = rec.get("src_ip", "")
+                dst_ip = rec.get("dst_ip", "")
+                if src_ip in blocked_set or dst_ip in blocked_set:
+                    continue
+                f = Flow(
+                    timestamp=parse_timestamp(rec.get("ts")),
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    proto=normalize_protocol(rec.get("proto", "")),
+                    bytes=int(rec.get("bytes") or 0),
+                    extra=build_flow_extra(rec),
+                    source="batch",
+                )
+                flow_records.append(f)
+                db.session.add(f)
+            if flow_records:
+                try:
+                    db.session.flush()
+                    flow_ids = [f.id for f in flow_records]
+                    db.session.commit()
+                    enforce_batch_flow_retention()
+                    enqueue_flow_scoring(flow_ids)
+                except Exception as exc:
+                    db.session.rollback()
+                    app.logger.exception("batch ingest failed: %s", exc)
+
+
+_batch_capture_agent = _BatchCaptureAgent()
+
+# Module-level record of the auto-detected interface (set by /capture/autostart)
+_detected_interface: dict | None = None
+
+
+def _auto_detect_interface() -> dict | None:
+    """
+    Return {"device": tshark_device, "name": friendly_name} for the adapter
+    carrying the default route. Falls back to the first non-loopback interface.
+    """
+    tshark = _find_tshark()
+    if not tshark:
+        return None
+
+    win_names = _get_windows_adapter_names() if sys.platform == "win32" else {}
+    default_guid: str | None = None
+
+    if sys.platform == "win32":
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                 "$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
+                 "Sort-Object RouteMetric | Select-Object -First 1; "
+                 "Get-NetAdapter -InterfaceIndex $r.InterfaceIndex | "
+                 "Select-Object InterfaceGuid | ConvertTo-Json"],
+                capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            data = json.loads(result.stdout.decode("utf-8", errors="replace"))
+            default_guid = str(data.get("InterfaceGuid", "")).strip("{}").upper() or None
+        except Exception:
+            pass
+
+    try:
+        result = subprocess.run(
+            [tshark, "-D"],
+            capture_output=True, timeout=5,
+            cwd=os.path.dirname(os.path.abspath(tshark)),
+            env=_tshark_env(tshark),
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        tshark_out = result.stdout.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    first_valid: dict | None = None
+    for line in tshark_out.strip().splitlines():
+        m = re.match(r"\d+\.\s+(\S+)(?:\s+\((.+)\))?", line.strip())
+        if not m:
+            continue
+        device, name = m.group(1), m.group(2) or ""
+        if not name:
+            guid_m = re.search(r"\{([0-9A-Fa-f-]+)\}", device)
+            if guid_m:
+                name = win_names.get(guid_m.group(1).upper(), "") or device
+        if not name:
+            name = device
+        if "loopback" in name.lower() or "loopback" in device.lower():
+            continue
+        entry = {"device": device, "name": name}
+        if first_valid is None:
+            first_valid = entry
+        if default_guid:
+            guid_m = re.search(r"\{([0-9A-Fa-f-]+)\}", device)
+            if guid_m and guid_m.group(1).upper() == default_guid:
+                return entry
+    return first_valid
+
+
 init_db()
 
 # ---------------------------------------------------------------
@@ -1574,26 +1989,36 @@ def agent_status():
     return jsonify(_capture_agent.status())
 
 
-@app.post("/agent/start")
-def agent_start():
-    payload = request.get_json(silent=True) or {}
-    interface = str(payload.get("interface") or "").strip()
-    if not interface:
-        return jsonify({"error": "interface required"}), 400
+@app.get("/capture_status")
+def capture_status():
+    tshark = _find_tshark()
+    return jsonify({
+        "interface": _detected_interface,
+        "tshark_found": tshark is not None,
+        "live": _capture_agent.status(),
+        "batch": _batch_capture_agent.status(),
+    })
+
+
+@app.post("/capture/autostart")
+def capture_autostart():
+    global _detected_interface
     tshark = _find_tshark()
     if not tshark:
         return jsonify({"error": "tshark not found"}), 503
+    iface = _auto_detect_interface()
+    if not iface:
+        return jsonify({"error": "no suitable network interface detected"}), 503
+    _detected_interface = iface
     try:
-        _capture_agent.start(interface, tshark)
+        _capture_agent.start(iface["device"], tshark)
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-    return jsonify({"status": "started", "interface": interface})
-
-
-@app.post("/agent/stop")
-def agent_stop():
-    _capture_agent.stop()
-    return jsonify({"status": "stopped"})
+        app.logger.warning("live capture failed to start: %s", exc)
+    try:
+        _batch_capture_agent.start(iface["device"], tshark)
+    except Exception as exc:
+        app.logger.warning("batch capture failed to start: %s", exc)
+    return jsonify({"status": "ok", "interface": iface})
 
 
 # ---------------------------------------------------------------

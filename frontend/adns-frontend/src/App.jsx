@@ -79,10 +79,7 @@ export default function App() {
   const [killBusy, setKillBusy] = useState(false);
   const [blockMessage, setBlockMessage] = useState("");
   const [blockedIps, setBlockedIps] = useState([]);
-  const [agentStatus, setAgentStatus] = useState(null);
-  const [interfaces, setInterfaces] = useState([]);
-  const [selectedIface, setSelectedIface] = useState("");
-  const [agentBusy, setAgentBusy] = useState(false);
+  const [captureStatus, setCaptureStatus] = useState(null);
   const [timezone, setTimezone] = useState(
     () => localStorage.getItem("adns_timezone") || Intl.DateTimeFormat().resolvedOptions().timeZone
   );
@@ -132,50 +129,12 @@ export default function App() {
     }
   };
 
-  const fetchAgentStatus = useCallback(async () => {
+  const fetchCaptureStatus = useCallback(async () => {
     try {
-      const res = await api.get("/api/agent/status");
-      setAgentStatus(res.data);
+      const res = await api.get("/api/capture_status");
+      setCaptureStatus(res.data);
     } catch { /* degrades gracefully */ }
   }, []);
-
-  const fetchInterfaces = useCallback(async () => {
-    try {
-      const res = await api.get("/api/interfaces");
-      const list = res.data || [];
-      setInterfaces(list);
-      setSelectedIface((prev) => {
-        if (prev) return prev;
-        const first = list.find((i) => !i.name.toLowerCase().includes("loopback"));
-        return first ? first.device : "";
-      });
-    } catch { /* dropdown stays empty until next poll */ }
-  }, []);
-
-  const startCapture = async () => {
-    if (!selectedIface) return;
-    setAgentBusy(true);
-    try {
-      await api.post("/api/agent/start", { interface: selectedIface });
-      await fetchAgentStatus();
-    } catch (err) {
-      setError("Failed to start capture: " + (err.response?.data?.error || err.message));
-    } finally {
-      setAgentBusy(false);
-    }
-  };
-
-  const stopCapture = async () => {
-    setAgentBusy(true);
-    try {
-      await api.post("/api/agent/stop");
-      await fetchAgentStatus();
-    } catch {
-      setError("Failed to stop capture");
-    } finally {
-      setAgentBusy(false);
-    }
-  };
 
   const fetchLatest = useCallback(async () => {
     try {
@@ -240,14 +199,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchInterfaces();
-  }, [fetchInterfaces]);
-
-  useEffect(() => {
-    fetchAgentStatus();
-    const id = setInterval(fetchAgentStatus, 3000);
+    fetchCaptureStatus();
+    const id = setInterval(fetchCaptureStatus, 3000);
     return () => clearInterval(id);
-  }, [fetchAgentStatus]);
+  }, [fetchCaptureStatus]);
 
   const toggleKillSwitch = async () => {
     setKillBusy(true);
@@ -741,7 +696,7 @@ export default function App() {
                 <span className="batch-status">
                   {batchSummary?.last_batch_received
                     ? `Last batch: ${formatRelativeTime(batchSummary.last_batch_received)}`
-                    : "No batch data — start batch_capture.py agent"}
+                    : "No batch data yet — check Settings for capture status"}
                 </span>
               </div>
 
@@ -749,7 +704,7 @@ export default function App() {
                 <p className="empty-state">Loading batch data…</p>
               ) : !batchSummary || batchSummary.total_flows === 0 ? (
                 <p className="empty-state">
-                  No batch flows in the last {batchWindow} window. Run <code>agent/batch_capture.py</code> to begin.
+                  No batch flows in the last {batchWindow} window. Batch capture starts automatically — check the Settings tab for status.
                 </p>
               ) : (
                 <>
@@ -897,94 +852,63 @@ export default function App() {
                 <div className="panel-heading">
                   <div className="panel-title-group">
                     <h3>Capture pipeline</h3>
-                    <p>Live traffic ingestion via tshark.</p>
+                    <p>Monitoring starts automatically on launch.</p>
                   </div>
                 </div>
 
                 <div className="pipeline-indicators">
                   <div className="pipeline-row">
-                    <span className="pipeline-label">tshark</span>
-                    <span
-                      className={`status-dot ${agentStatus?.tshark_found ? "dot-ok" : "dot-err"}`}
-                    />
+                    <span className="pipeline-label">Interface</span>
+                    <span className={`status-dot ${captureStatus?.interface ? "dot-ok" : "dot-idle"}`} />
                     <span className="pipeline-value">
-                      {agentStatus == null
-                        ? "…"
-                        : agentStatus.tshark_found
-                        ? "Found"
-                        : "Not installed"}
+                      {captureStatus?.interface?.name ?? (captureStatus ? "Not detected" : "…")}
                     </span>
                   </div>
                   <div className="pipeline-row">
-                    <span className="pipeline-label">Capture</span>
-                    <span
-                      className={`status-dot ${agentStatus?.running ? "dot-ok" : "dot-idle"}`}
-                    />
+                    <span className="pipeline-label">tshark</span>
+                    <span className={`status-dot ${captureStatus?.tshark_found ? "dot-ok" : "dot-err"}`} />
                     <span className="pipeline-value">
-                      {agentStatus?.running ? "Running" : "Stopped"}
+                      {captureStatus == null ? "…" : captureStatus.tshark_found ? "Found" : "Not installed"}
                     </span>
                   </div>
-                  {agentStatus?.running && (
-                    <>
-                      <div className="pipeline-row">
-                        <span className="pipeline-label">Flows</span>
-                        <span className="pipeline-value">
-                          {agentStatus.flows_captured ?? 0} captured
-                        </span>
-                      </div>
-                      <div className="pipeline-row">
-                        <span className="pipeline-label">Last packet</span>
-                        <span className="pipeline-value">
-                          {formatRelativeTime(agentStatus.last_ingest)}
-                        </span>
-                      </div>
-                      {agentStatus.uptime_seconds != null && (
-                        <div className="pipeline-row">
-                          <span className="pipeline-label">Uptime</span>
-                          <span className="pipeline-value">
-                            {Math.round(agentStatus.uptime_seconds)}s
-                          </span>
-                        </div>
-                      )}
-                    </>
-                  )}
-                  {agentStatus?.last_error && (
-                    <p className="pipeline-error">{agentStatus.last_error}</p>
-                  )}
-                </div>
 
-                <div className="capture-controls">
-                  <select
-                    className="iface-select"
-                    value={selectedIface}
-                    onChange={(e) => setSelectedIface(e.target.value)}
-                    disabled={agentStatus?.running || agentBusy}
-                  >
-                    <option value="">Select interface…</option>
-                    {interfaces.map((iface) => (
-                      <option key={iface.device} value={iface.device}>
-                        {iface.name}
-                      </option>
-                    ))}
-                  </select>
-                  {agentStatus?.running ? (
-                    <button
-                      type="button"
-                      className="simulate-btn is-active"
-                      onClick={stopCapture}
-                      disabled={agentBusy}
-                    >
-                      Stop capture
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="simulate-btn"
-                      onClick={startCapture}
-                      disabled={!selectedIface || agentBusy || !agentStatus?.tshark_found}
-                    >
-                      Start capture
-                    </button>
+                  <div className="pipeline-row" style={{marginTop: 6}}>
+                    <span className="pipeline-label">Live</span>
+                    <span className={`status-dot ${captureStatus?.live?.running ? "dot-ok" : "dot-idle"}`} />
+                    <span className="pipeline-value">
+                      {captureStatus?.live?.running
+                        ? `Running · ${(captureStatus.live.flows_captured ?? 0).toLocaleString()} flows`
+                        : "Stopped"}
+                    </span>
+                  </div>
+                  {captureStatus?.live?.running && captureStatus.live.last_ingest && (
+                    <div className="pipeline-row">
+                      <span className="pipeline-label">Last packet</span>
+                      <span className="pipeline-value">{formatRelativeTime(captureStatus.live.last_ingest)}</span>
+                    </div>
+                  )}
+
+                  <div className="pipeline-row" style={{marginTop: 6}}>
+                    <span className="pipeline-label">Batch</span>
+                    <span className={`status-dot ${captureStatus?.batch?.running ? "dot-ok" : "dot-idle"}`} />
+                    <span className="pipeline-value">
+                      {captureStatus?.batch?.running
+                        ? `Running · ${captureStatus.batch.batches_processed ?? 0} batches`
+                        : "Stopped"}
+                    </span>
+                  </div>
+                  {captureStatus?.batch?.running && captureStatus.batch.last_batch && (
+                    <div className="pipeline-row">
+                      <span className="pipeline-label">Last batch</span>
+                      <span className="pipeline-value">{formatRelativeTime(captureStatus.batch.last_batch)}</span>
+                    </div>
+                  )}
+
+                  {captureStatus?.live?.last_error && (
+                    <p className="pipeline-error">Live: {captureStatus.live.last_error}</p>
+                  )}
+                  {captureStatus?.batch?.last_error && (
+                    <p className="pipeline-error">Batch: {captureStatus.batch.last_error}</p>
                   )}
                 </div>
               </section>

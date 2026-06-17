@@ -146,12 +146,8 @@ class TestAgentStatus:
                 body = client.get("/agent/status").get_json()
         assert body["tshark_found"] is False
 
-    def test_agent_start_missing_interface_returns_400(self, client, app):
-        with app.app_context():
-            res = client.post(
-                "/agent/start",
-                data=json.dumps({}),
-                content_type="application/json",
-            )
-        assert res.status_code == 400
-        assert "interface" in res.get_json()["error"]
+    def test_capture_status_returns_expected_keys(self, client, app):
+        with patch("app._find_tshark", return_value="tshark.exe"):
+            with app.app_context():
+                body = client.get("/capture_status").get_json()
+        assert {"interface", "tshark_found", "live", "batch"} <= set(body.keys())

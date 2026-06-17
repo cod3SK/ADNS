@@ -3,19 +3,17 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import logging
-import math
 import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable, Sequence, Tuple
+from typing import Sequence, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = BASE_DIR / "model_artifacts" / "flow_detector.joblib"
 DEFAULT_META_MODEL_PATH = BASE_DIR / "model_artifacts" / "meta_model_combined.joblib"
 
 logger = logging.getLogger(__name__)
@@ -34,58 +32,6 @@ def _timestamp_to_epoch(ts: datetime | None) -> float:
     if ts.tzinfo is not None:
         return float(ts.timestamp())
     return float(ts.replace(tzinfo=None).timestamp())
-
-
-class FlowModel:
-    """Wrapper around the legacy sklearn pipeline with byte/proto features."""
-
-    def __init__(self, model_path: str | os.PathLike | None = None) -> None:
-        resolved = Path(model_path or os.environ.get("ADNS_MODEL_PATH", DEFAULT_MODEL_PATH))
-        if not resolved.exists():
-            raise FileNotFoundError(f"model artifact not found at {resolved}")
-        payload = joblib.load(resolved)
-        self.pipeline = payload["model"]
-        self.anomaly_threshold = float(payload.get("threshold_anomaly", 0.6))
-        self.watch_threshold = float(
-            payload.get("threshold_watch", max(0.2, self.anomaly_threshold * 0.65))
-        )
-        self.model_path = resolved
-
-    def _feature_dict(self, bytes_count: int, proto: str) -> dict:
-        total_bytes = max(0.0, float(bytes_count or 0))
-        proto_norm = (proto or "OTHER").upper()
-        return {
-            "total_bytes": total_bytes,
-            "log_total_bytes": math.log1p(total_bytes),
-            "proto": proto_norm,
-        }
-
-    def _label_for_probability(self, prob: float) -> str:
-        if prob >= self.anomaly_threshold:
-            return "anomaly"
-        if prob >= self.watch_threshold:
-            return "watch"
-        return "normal"
-
-    def score(self, flow) -> Tuple[float, str]:
-        results = self.score_many([flow])
-        return results[0] if results else (0.0, "normal")
-
-    def score_many(self, flows: Sequence) -> list[Tuple[float, str, str | None]]:
-        if not flows:
-            return []
-
-        rows = []
-        for flow in flows:
-            bytes_count = getattr(flow, "bytes", flow)
-            proto = getattr(flow, "proto", getattr(flow, "protocol", ""))
-            rows.append(self._feature_dict(bytes_count, proto))
-        frame = pd.DataFrame(rows)
-        probabilities = self.pipeline.predict_proba(frame)[:, 1]
-        return [
-            (float(prob), self._label_for_probability(float(prob)))
-            for prob in probabilities
-        ]
 
 
 @dataclass
@@ -512,83 +458,53 @@ class MetaEnsembleModel:
 
 class DetectionEngine:
     """
-    Attempts to load the new meta ensemble first, then the legacy FlowModel,
-    finally the heuristic FlowScorer if no artifacts are provisioned.
+    Loads MetaEnsembleModel from model_artifacts/. Returns neutral (0.0, "normal")
+    scores when the artifact is absent so the app stays functional without model files.
     """
 
     def __init__(self) -> None:
-        self._mode = "heuristic"
-        self.model = None
-        self._artifact_mtimes: dict[str, float] = {}
+        self.model: MetaEnsembleModel | None = None
+        self._artifact_mtime: float = 0.0
         self._load_model()
-
-    @property
-    def mode(self) -> str:
-        return self._mode
 
     def reload(self) -> None:
         self._load_model()
 
     def reload_if_stale(self) -> None:
-        current = self._capture_artifact_mtimes()
-        if current != self._artifact_mtimes:
+        path = self._meta_path()
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            return
+        if mtime != self._artifact_mtime:
             logger.info("reloading detection engine after model artifact change")
             self._load_model()
 
     def predict(self, session, flow):
         self.reload_if_stale()
-        if self._mode in {"meta", "ml"}:
-            return self.model.score(flow)
-        return self.model.predict(session, flow)
+        if self.model is None:
+            return (0.0, "normal")
+        return self.model.score(flow)
 
     def predict_many(self, session, flows: Sequence) -> list[Tuple[float, str]]:
         if not flows:
             return []
         self.reload_if_stale()
-        if self._mode in {"meta", "ml"}:
-            return self.model.score_many(flows)
-        return [self.model.predict(session, flow) for flow in flows]
+        if self.model is None:
+            return [(0.0, "normal")] * len(flows)
+        return self.model.score_many(flows)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def _meta_path(self) -> Path:
+        env = os.environ.get("ADNS_META_MODEL_PATH")
+        return Path(env) if env else DEFAULT_META_MODEL_PATH
+
     def _load_model(self) -> None:
-        loaders: Iterable[tuple[str, Callable[[], object]]] = (
-            ("meta", MetaEnsembleModel),
-            ("ml", FlowModel),
-        )
-
-        for mode, factory in loaders:
-            try:
-                self.model = factory()
-                self._mode = mode
-                break
-            except FileNotFoundError:
-                continue
-        else:
-            from scoring import FlowScorer  # deferred import to avoid optional deps at import time
-
-            self.model = FlowScorer()
-            self._mode = "heuristic"
-
-        self._artifact_mtimes = self._capture_artifact_mtimes()
-        logger.info("DetectionEngine initialized in %s mode", self._mode)
-
-    def _candidate_paths(self) -> list[Path]:
-        paths: list[Path] = []
-        meta_path = os.environ.get("ADNS_META_MODEL_PATH")
-        ml_path = os.environ.get("ADNS_MODEL_PATH")
-        paths.append(Path(meta_path) if meta_path else DEFAULT_META_MODEL_PATH)
-        paths.append(Path(ml_path) if ml_path else DEFAULT_MODEL_PATH)
-        return [p for p in paths if p]
-
-    def _capture_artifact_mtimes(self) -> dict[str, float]:
-        mtimes: dict[str, float] = {}
-        for path in self._candidate_paths():
-            try:
-                resolved = path.resolve()
-            except FileNotFoundError:
-                continue
-            if resolved.exists():
-                mtimes[str(resolved)] = resolved.stat().st_mtime
-        return mtimes
+        path = self._meta_path()
+        try:
+            self.model = MetaEnsembleModel(path)
+            self._artifact_mtime = path.stat().st_mtime if path.exists() else 0.0
+            logger.info("DetectionEngine loaded meta model from %s", path)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            self.model = None
+            self._artifact_mtime = 0.0
+            logger.warning("Meta model artifact unavailable, scoring disabled: %s", exc)
