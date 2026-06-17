@@ -1503,7 +1503,21 @@ def _auto_detect_interface() -> dict | None:
     except Exception:
         return None
 
-    first_valid: dict | None = None
+    def _is_virtual(name: str) -> bool:
+        n = name.lower()
+        return (
+            "*" in name          # Windows marker for virtual/software adapters
+            or "loopback" in n
+            or "bluetooth" in n
+            or "miniport" in n
+            or "tunnel" in n
+            or "teredo" in n
+            or "isatap" in n
+        )
+
+    first_physical: dict | None = None   # best fallback: non-virtual, non-loopback
+    first_any: dict | None = None        # last resort: any non-loopback
+
     for line in tshark_out.strip().splitlines():
         m = re.match(r"\d+\.\s+(\S+)(?:\s+\((.+)\))?", line.strip())
         if not m:
@@ -1518,13 +1532,17 @@ def _auto_detect_interface() -> dict | None:
         if "loopback" in name.lower() or "loopback" in device.lower():
             continue
         entry = {"device": device, "name": name}
-        if first_valid is None:
-            first_valid = entry
-        if default_guid:
+        if first_any is None:
+            first_any = entry
+        if not _is_virtual(name) and first_physical is None:
+            first_physical = entry
+        # GUID match: only trust it for physical adapters
+        if default_guid and not _is_virtual(name):
             guid_m = re.search(r"\{([0-9A-Fa-f-]+)\}", device)
             if guid_m and guid_m.group(1).upper() == default_guid:
                 return entry
-    return first_valid
+
+    return first_physical or first_any
 
 
 init_db()
