@@ -105,24 +105,44 @@ def _port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _kill_port(port: int) -> bool:
-    """Kill whatever process is listening on *port*. Returns True once port is free."""
-    import subprocess as _sp
-    script = (
-        f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue; "
-        f"if ($c) {{ Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue }}"
+def _reclaim_port(port: int) -> bool:
+    """
+    Free *port* so Flask can bind to it.  Returns True once the port is clear.
+
+    Strategy:
+      1. Kill other ADNS.exe processes by name — handles the tray-leftover case.
+      2. Kill whatever process specifically owns the port — fallback for anything else.
+      3. Poll up to 5 s for the OS to release the socket.
+    """
+    own_pid = os.getpid()
+    _NO_WIN = 0x08000000  # CREATE_NO_WINDOW
+
+    # Step 1: kill other ADNS instances by name (most common cause)
+    ps_kill_adns = (
+        f"Get-Process -Name 'ADNS' -ErrorAction SilentlyContinue "
+        f"| Where-Object {{ $_.Id -ne {own_pid} }} "
+        f"| Stop-Process -Force -ErrorAction SilentlyContinue"
     )
-    try:
-        _sp.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            creationflags=0x08000000,
-            capture_output=True,
-            timeout=10,
-        )
-    except Exception:
-        pass
-    # Wait up to 3 s for the OS to release the socket
-    for _ in range(6):
+    # Step 2: kill whatever owns the port (covers non-ADNS edge cases)
+    ps_kill_port = (
+        f"Get-NetTCPConnection -LocalPort {port} -State Listen "
+        f"-ErrorAction SilentlyContinue "
+        f"| Select-Object -First 1 "
+        f"| ForEach-Object {{ "
+        f"if ($_.OwningProcess -ne {own_pid}) {{ "
+        f"Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }} }}"
+    )
+    for script in (ps_kill_adns, ps_kill_port):
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                creationflags=_NO_WIN, capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
+
+    # Poll up to 5 s for the socket to be released
+    for _ in range(10):
         time.sleep(0.5)
         if not _port_in_use(port):
             return True
@@ -213,13 +233,11 @@ def main() -> None:
 
     data_dir = _data_dir()
 
-    if _port_in_use(5000):
-        # Likely a leftover ADNS process from a previous session — try to reclaim the port.
-        if not _kill_port(5000):
-            _fatal(
-                "Port 5000 is already in use by another application.\n\n"
-                "Open Task Manager, find the process using port 5000, and close it, then try again."
-            )
+    if _port_in_use(5000) and not _reclaim_port(5000):
+        _fatal(
+            "Port 5000 is in use by another application and could not be freed.\n\n"
+            "Open Task Manager, find the process using port 5000, close it, then try again."
+        )
 
     t = threading.Thread(target=_start_flask, args=(data_dir,), daemon=True)
     t.start()
