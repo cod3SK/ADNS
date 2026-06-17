@@ -105,6 +105,27 @@ def _port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _kill_port(port: int) -> bool:
+    """Kill whatever process owns the given TCP port. Returns True if port is now free."""
+    import subprocess as _sp
+    try:
+        out = _sp.check_output(
+            ["netstat", "-ano"],
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        ).decode("utf-8", errors="replace")
+        for line in out.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                parts = line.split()
+                pid = int(parts[-1])
+                if pid and pid != os.getpid():
+                    _sp.run(["taskkill", "/F", "/PID", str(pid)],
+                            creationflags=0x08000000, capture_output=True)
+    except Exception:
+        pass
+    time.sleep(0.5)
+    return not _port_in_use(port)
+
+
 def _is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -190,11 +211,12 @@ def main() -> None:
     data_dir = _data_dir()
 
     if _port_in_use(5000):
-        _fatal(
-            "Port 5000 is already in use.\n\n"
-            "Another application (or a leftover ADNS process) is running on port 5000.\n"
-            "Open Task Manager, find the process using port 5000, and close it, then try again."
-        )
+        # Likely a leftover ADNS process from a previous session — try to reclaim the port.
+        if not _kill_port(5000):
+            _fatal(
+                "Port 5000 is already in use by another application.\n\n"
+                "Open Task Manager, find the process using port 5000, and close it, then try again."
+            )
 
     t = threading.Thread(target=_start_flask, args=(data_dir,), daemon=True)
     t.start()
