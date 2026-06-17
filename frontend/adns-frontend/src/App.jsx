@@ -80,6 +80,7 @@ export default function App() {
   const [blockMessage, setBlockMessage] = useState("");
   const [blockedIps, setBlockedIps] = useState([]);
   const [captureStatus, setCaptureStatus] = useState(null);
+  const [modelStatus, setModelStatus] = useState(null);
   const [timezone, setTimezone] = useState(
     () => localStorage.getItem("adns_timezone") || Intl.DateTimeFormat().resolvedOptions().timeZone
   );
@@ -133,6 +134,13 @@ export default function App() {
     try {
       const res = await api.get("/api/capture_status");
       setCaptureStatus(res.data);
+    } catch { /* degrades gracefully */ }
+  }, []);
+
+  const fetchModelStatus = useCallback(async () => {
+    try {
+      const res = await api.get("/api/model_status");
+      setModelStatus(res.data);
     } catch { /* degrades gracefully */ }
   }, []);
 
@@ -203,6 +211,12 @@ export default function App() {
     const id = setInterval(fetchCaptureStatus, 3000);
     return () => clearInterval(id);
   }, [fetchCaptureStatus]);
+
+  useEffect(() => {
+    fetchModelStatus();
+    const id = setInterval(fetchModelStatus, 10000);
+    return () => clearInterval(id);
+  }, [fetchModelStatus]);
 
   const toggleKillSwitch = async () => {
     setKillBusy(true);
@@ -909,6 +923,66 @@ export default function App() {
                   )}
                   {captureStatus?.batch?.last_error && (
                     <p className="pipeline-error">Batch: {captureStatus.batch.last_error}</p>
+                  )}
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-heading">
+                  <div className="panel-title-group">
+                    <h3>Model Health</h3>
+                    <p>Validates each ML estimator with a dummy prediction at runtime.</p>
+                  </div>
+                </div>
+                <div className="pipeline-indicators">
+                  {modelStatus == null ? (
+                    <div className="pipeline-row">
+                      <span className="pipeline-label">Status</span>
+                      <span className="pipeline-value">…</span>
+                    </div>
+                  ) : (
+                    <>
+                      {["xgboost", "extra_trees"].map((name) => {
+                        const info = modelStatus.estimators?.[name];
+                        const dot = info == null ? "dot-idle"
+                          : info.status === "ok" ? "dot-ok"
+                          : "dot-err";
+                        const label = info == null ? "Not in bundle"
+                          : info.status === "ok" ? "OK"
+                          : "Broken";
+                        return (
+                          <div className="pipeline-row" key={name}>
+                            <span className="pipeline-label">{name === "extra_trees" ? "ExtraTrees" : "XGBoost"}</span>
+                            <span className={`status-dot ${dot}`} />
+                            <span className="pipeline-value">
+                              {label}
+                              {info?.error && (
+                                <span className="pipeline-error" style={{display:"inline",marginLeft:6,fontSize:"0.78rem"}}>
+                                  {info.error}
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                        );
+                      })}
+                      <div className="pipeline-row" style={{marginTop: 6, borderTop: "1px solid #e5e7eb", paddingTop: 6}}>
+                        <span className="pipeline-label">Meta-model</span>
+                        <span className={`status-dot ${
+                          modelStatus.meta_model_status === "ok" ? "dot-ok"
+                          : modelStatus.meta_model_status === "degraded" ? "dot-warn"
+                          : "dot-err"
+                        }`} />
+                        <span className="pipeline-value">
+                          {modelStatus.meta_model_status === "ok"
+                            ? `OK · ${modelStatus.active_estimators}/${modelStatus.total_estimators} estimators`
+                            : modelStatus.meta_model_status === "degraded"
+                            ? `Degraded · ${modelStatus.active_estimators}/${modelStatus.total_estimators} estimators active`
+                            : modelStatus.meta_model_status === "absent"
+                            ? "Artifact not found"
+                            : `All estimators broken`}
+                        </span>
+                      </div>
+                    </>
                   )}
                 </div>
               </section>

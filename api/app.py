@@ -17,7 +17,8 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import inspect, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from model_runner import DetectionEngine
+import numpy as np
+from model_runner import DetectionEngine, MetaFeatureBuilder
 from task_queue import enqueue_flow_scoring
 
 try:
@@ -2034,6 +2035,54 @@ def capture_status():
         "tshark_found": tshark is not None,
         "live": _capture_agent.status(),
         "batch": _batch_capture_agent.status(),
+    })
+
+
+@app.get("/model_status")
+def model_status():
+    """Probe each ML estimator in the meta-model bundle and report health."""
+    test_X = np.zeros((1, len(MetaFeatureBuilder.FEATURE_COLUMNS)), dtype="float32")
+
+    if simulation_detector.model is None:
+        return jsonify({
+            "meta_model_status": "absent",
+            "active_estimators": 0,
+            "total_estimators": 0,
+            "estimators": {},
+        })
+
+    estimators: dict = {}
+    active = 0
+
+    for name, model in simulation_detector.model.models.items():
+        n_feat = getattr(model, "n_features_in_", test_X.shape[1])
+        X = simulation_detector.model._match_shape(test_X, n_feat)
+        ok = False
+        err_msg: str | None = None
+        for method in ("predict_proba", "predict"):
+            try:
+                getattr(model, method)(X)
+                ok = True
+                break
+            except Exception as exc:
+                err_msg = f"{type(exc).__name__}: {exc}"
+        if ok:
+            active += 1
+        estimators[name] = {"status": "ok" if ok else "broken", "error": None if ok else err_msg}
+
+    total = len(simulation_detector.model.models)
+    if active == total:
+        overall = "ok"
+    elif active > 0:
+        overall = "degraded"
+    else:
+        overall = "broken"
+
+    return jsonify({
+        "meta_model_status": overall,
+        "active_estimators": active,
+        "total_estimators": total,
+        "estimators": estimators,
     })
 
 

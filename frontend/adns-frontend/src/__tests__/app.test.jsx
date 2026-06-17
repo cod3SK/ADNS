@@ -36,6 +36,7 @@ function stubApi(overrides = {}) {
     '/api/blocked_ips':     { data: [] },
     '/api/agent/status':    { data: { running: false, tshark_found: false, flows_captured: 0 } },
     '/api/interfaces':      { data: [] },
+    '/api/model_status':    { data: { meta_model_status: 'ok', active_estimators: 2, total_estimators: 2, estimators: { xgboost: { status: 'ok', error: null }, extra_trees: { status: 'ok', error: null } } } },
   }
   const merged = { ...defaults, ...overrides }
   api.get.mockImplementation((url) => Promise.resolve(merged[url] ?? { data: null }))
@@ -126,17 +127,17 @@ describe('App component', () => {
     })
   })
 
-  it('shows capture pipeline section', async () => {
+  it('shows Settings tab in nav', async () => {
     render(<App />)
     await waitFor(() => {
-      expect(screen.getByText(/capture pipeline/i)).toBeTruthy()
+      expect(screen.getByText('Settings')).toBeTruthy()
     })
   })
 
-  it('shows Start capture button when agent not running', async () => {
+  it('shows Dashboard tab active by default', async () => {
     render(<App />)
     await waitFor(() => {
-      expect(screen.getByText(/start capture/i)).toBeTruthy()
+      expect(screen.getByText('Dashboard')).toBeTruthy()
     })
   })
 })

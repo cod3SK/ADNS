@@ -402,9 +402,14 @@ class MetaEnsembleModel:
             vector = self._match_shape(values, getattr(model, "n_features_in_", values.shape[1]))
             try:
                 probs = model.predict_proba(vector)
-            except AttributeError:
-                logits = model.predict(vector)
-                probs = np.array(logits).reshape(-1, 1)
+            except Exception as exc:
+                logger.warning("estimator %s predict_proba failed (%s: %s), trying predict", name, type(exc).__name__, exc)
+                try:
+                    logits = model.predict(vector)
+                    probs = np.array(logits).reshape(-1, 1)
+                except Exception as exc2:
+                    logger.warning("estimator %s predict also failed (%s: %s), skipping", name, type(exc2).__name__, exc2)
+                    continue
 
             probs = np.asarray(probs, dtype="float32")
             classes = getattr(model, "classes_", None)

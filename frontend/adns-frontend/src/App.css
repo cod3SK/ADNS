@@ -539,6 +539,7 @@ body {
 }
 
 .dot-ok   { background: #22c55e; box-shadow: 0 0 6px rgba(34, 197, 94, 0.5); }
+.dot-warn { background: #f59e0b; box-shadow: 0 0 6px rgba(245, 158, 11, 0.5); }
 .dot-err  { background: #ef4444; }
 .dot-idle { background: #9ca3af; }
 
