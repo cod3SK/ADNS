@@ -66,8 +66,10 @@ if ($npmAvailable) {
     throw "npm is not installed and no pre-built dist found.`nInstall Node.js 18+ (https://nodejs.org) or copy a pre-built dist/ into frontend/adns-frontend/dist."
 }
 
-# 2. PyInstaller
+# 2. PyInstaller — kill any running ADNS process first so dist\ADNS\ isn't locked
 Write-Host "`n[2/3] Running PyInstaller..." -ForegroundColor Yellow
+Get-Process -Name "ADNS" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
 Set-Location $Root
 pyinstaller ADNS.spec --clean -y
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }

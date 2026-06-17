@@ -1122,13 +1122,33 @@ _capture_agent = _CaptureAgent()
 # Batch capture agent — ring-buffer tshark + two-pass pcap processing
 # ---------------------------------------------------------------
 
+# tshark 4.x conv output has no pipe chars in data rows; bytes use human units (bytes/kB/MB/GB).
+# Example data line (header pipes are decorative):
+#   10.0.0.1:443  <->  192.168.1.2:58432    12 1530 bytes    58 85 kB    70 87 kB    0.000000  30.1234
 _BATCH_CONV_RE = re.compile(
-    r"(\S+):(\d+)\s+<->\s+(\S+):(\d+)\s*"
-    r"\|\s*(\d+)\s+(\d+)\s*\|\s*"
-    r"\|\s*(\d+)\s+(\d+)\s*\|\s*"
-    r"\|\s*\d+\s+\d+\s*\|"
-    r"\s*([\d.]+)\s*\|\s*([\d.]+)"
+    r"(\S+):(\d+)\s+<->\s+(\S+):(\d+)\s+"
+    r"(\d+)\s+([\d.]+)\s+(\S+)\s+"   # frames_ba  bytes_ba_val  bytes_ba_unit
+    r"(\d+)\s+([\d.]+)\s+(\S+)\s+"   # frames_ab  bytes_ab_val  bytes_ab_unit
+    r"\d+\s+[\d.]+\s+\S+\s+"         # total (skip)
+    r"([\d.]+)\s+"                    # rel_start
+    r"([\d.]+)"                       # duration
 )
+
+
+def _parse_tshark_bytes(value: str, unit: str) -> int:
+    """Convert tshark human-readable size (e.g. '85 kB') to integer bytes."""
+    try:
+        n = float(value)
+        u = unit.lower()
+        if u in ("kb", "kib"):
+            return int(n * 1024)
+        if u in ("mb", "mib"):
+            return int(n * 1024 * 1024)
+        if u in ("gb", "gib"):
+            return int(n * 1024 * 1024 * 1024)
+        return int(n)
+    except (ValueError, TypeError):
+        return 0
 
 _BATCH_PASS2_FIELDS = [
     "frame.time_epoch", "ip.src", "ip.dst", "ip.proto",
@@ -1320,12 +1340,16 @@ class _BatchCaptureAgent:
             m = _BATCH_CONV_RE.search(line)
             if not m:
                 continue
-            a_ip, a_port, b_ip, b_port, frames_ba, bytes_ba, frames_ab, bytes_ab, rel_start, duration = m.groups()
+            (a_ip, a_port, b_ip, b_port,
+             frames_ba, bytes_ba_val, bytes_ba_unit,
+             frames_ab, bytes_ab_val, bytes_ab_unit,
+             rel_start, duration) = m.groups()
             flows.append({
                 "proto": current_proto,
                 "src_ip": a_ip, "src_port": int(a_port),
                 "dst_ip": b_ip, "dst_port": int(b_port),
-                "src_bytes": int(bytes_ab), "dst_bytes": int(bytes_ba),
+                "src_bytes": _parse_tshark_bytes(bytes_ab_val, bytes_ab_unit),
+                "dst_bytes": _parse_tshark_bytes(bytes_ba_val, bytes_ba_unit),
                 "src_pkts": int(frames_ab), "dst_pkts": int(frames_ba),
                 "duration": float(duration), "rel_start": float(rel_start),
             })

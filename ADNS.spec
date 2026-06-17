@@ -35,15 +35,17 @@ sklearn_datas, sklearn_binaries, sklearn_hiddenimports = collect_all("sklearn")
 webview_datas, webview_binaries, webview_hiddenimports = collect_all("webview")
 pystray_datas, pystray_binaries, pystray_hiddenimports = collect_all("pystray")
 
-# collect_all("xgboost") misses the native DLL — add it explicitly.
+# collect_all bundles xgboost Python files but misses the native DLL on Windows — add it explicitly.
 import xgboost as _xgb
+xgboost_datas, xgboost_binaries, xgboost_hiddenimports = collect_all("xgboost")
 _xgb_lib = os.path.join(os.path.dirname(_xgb.__file__), "lib", "xgboost.dll")
-_xgboost_binaries = [(_xgb_lib, "xgboost/lib")] if os.path.isfile(_xgb_lib) else []
+if os.path.isfile(_xgb_lib) and not any(_xgb_lib == src for src, _ in xgboost_binaries):
+    xgboost_binaries.append((_xgb_lib, "xgboost/lib"))
 
 a = Analysis(
     ["launcher.py"],
     pathex=["api"],          # so 'from app import ...' resolves
-    binaries=sklearn_binaries + webview_binaries + pystray_binaries + _xgboost_binaries,
+    binaries=sklearn_binaries + webview_binaries + pystray_binaries + xgboost_binaries,
     datas=[
         # React production build
         ("frontend/adns-frontend/dist", "dist"),
@@ -53,7 +55,7 @@ a = Analysis(
         ("api/*.py", "api"),
         # App icon (used by the desktop shortcut)
         ("assets/icon.ico", "assets"),
-    ] + sklearn_datas + webview_datas + pystray_datas + _tshark_datas + _npcap_datas,
+    ] + sklearn_datas + webview_datas + pystray_datas + xgboost_datas + _tshark_datas + _npcap_datas,
     hiddenimports=[
         # Flask ecosystem
         "flask_cors",
@@ -67,7 +69,6 @@ a = Analysis(
         "joblib",
         "numpy",
         "pandas",
-        "xgboost",
         # pywebview Windows backends
         "webview.platforms.winforms",
         "webview.platforms.edgechromium",
@@ -76,7 +77,7 @@ a = Analysis(
         "pystray._win32",
         "PIL",
         "PIL.Image",
-    ] + sklearn_hiddenimports + webview_hiddenimports + pystray_hiddenimports,
+    ] + sklearn_hiddenimports + webview_hiddenimports + pystray_hiddenimports + xgboost_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

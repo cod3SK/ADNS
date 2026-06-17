@@ -219,11 +219,20 @@ def _build_tray(window):
         window.show()
 
     def on_quit(icon, item):
-        icon.stop()
+        # Stop tshark before killing the process.
+        try:
+            from app import _capture_agent, _batch_capture_agent  # noqa: PLC0415
+            _capture_agent.stop()
+            _batch_capture_agent.stop()
+        except Exception:
+            pass
         srv = _flask_server
         if srv is not None:
-            srv.shutdown()
-        window.destroy()
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+        os._exit(0)  # window.destroy() from a non-main thread doesn't reliably unblock webview.start()
 
     menu = pystray.Menu(
         pystray.MenuItem("Open ADNS", on_show, default=True),

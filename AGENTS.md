@@ -3,64 +3,91 @@
 Use this page to remind yourself (or other assistants) what lives where in the ADNS stack and how the pieces talk to each other.
 
 ## Mission Snapshot
-- **Goal**: Demonstrate a modern network anomaly detection loop end to end (capture -> ingest -> score -> visualize) with synthetic attack simulations for workshops.
-- **Live topology**: `agent/capture.py` runs `tshark` on `eth0`, POSTs batches to the Flask API (Gunicorn on 127.0.0.1:5000; Nginx proxies `/api/*` to it). The API persists flows in PostgreSQL, enqueues flow IDs on Redis/RQ, and the scoring worker writes `Prediction` rows. The React/Vite dashboard (`frontend/adns-frontend/dist`) is served by Nginx at `http://159.203.105.167/`.
-- **Storage**: PostgreSQL holds `flows` + `predictions` (see `api/app.py`). Retention trims anything older than `ADNS_FLOW_RETENTION_MINUTES` or beyond `ADNS_FLOW_RETENTION_MAX_ROWS`. The DB URI now respects `SQLALCHEMY_DATABASE_URI` env (defaults to `postgresql://adns:adns_password@127.0.0.1/adns`).
-- **Models**: `api/model_runner.py` loads `model_artifacts/flow_detector.joblib` and `meta_model_combined.joblib` (ExtraTrees + XGBoost) to drive the DetectionEngine, falling back to heuristics if artifacts are absent. Training/data prep lives under `ml/`.
+- **Goal**: Demonstrate a modern network anomaly detection loop end to end (capture → ingest → score → visualize) with synthetic attack simulations for workshops and portfolio review.
+- **Live topology (desktop installer)**: `launcher.py` starts Flask in a background thread via Werkzeug. Flask serves both the API and the bundled React `dist/`. An in-process `ThreadPoolExecutor` handles async scoring. Packet capture runs as two embedded agents (`_CaptureAgent`, `_BatchCaptureAgent`) launched automatically on startup via `/capture/autostart`.
+- **Storage**: SQLite at `%APPDATA%\ADNS\adns.db` (desktop); PostgreSQL via `SQLALCHEMY_DATABASE_URI` (Docker/server). Tables: `flows` + `predictions`. Retention trims flows older than `ADNS_FLOW_RETENTION_MINUTES` or beyond `ADNS_FLOW_RETENTION_MAX_ROWS`.
+- **Models**: `api/model_runner.py` loads `meta_model_combined.joblib` (ExtraTrees + XGBoost ensemble) then `flow_detector.joblib` (calibrated LogisticRegression fallback), falling back to heuristics if artifacts are absent.
 
 ## Component Reference
 | Piece | Path | Notes |
 | --- | --- | --- |
-| Live capture agent | `agent/capture.py` | Wraps `tshark` (fields in `TSHARK_FIELDS`), infers ports/services, batches ~50 flows or ~2 s, retries POSTs with backoff. Settings read from env (`API_URL`, `TSHARK_BIN`, `INTERFACE`, `BATCH_SIZE`, `POST_INTERVAL`, `RETRY_DELAY`) with defaults. `requirements.txt` pins `requests`. |
-| Batch capture agent | `agent/batch_capture.py` | Standalone script for server/dev use. Ring-buffer tshark + two-pass pcap processing; POSTs to `/ingest_batch`. In the desktop installer the same logic runs embedded inside the API process via `_BatchCaptureAgent` (started automatically on launch). Env: `INTERFACE`, `TSHARK_BIN`, `BATCH_WINDOW_SECONDS` (default 15), `BATCH_DIR`, `BATCH_API_URL`. |
-| API | `api/app.py` | Flask + SQLAlchemy; exposes `/health`, `/ingest`, `/ingest_batch`, `/flows`, `/anomalies`, `/simulate`, `/batch_summary`, `/capture_status`, `/interfaces`, `/capture/autostart`, `/block_ip`, `/unblock_ip`. `Flow.source` column separates live (`'live'`) from ring-buffer (`'batch'`) flows with independent retention policies. `_BatchCaptureAgent` class embeds the two-pass pcap logic and runs in-process. `_auto_detect_interface()` finds the default-route adapter via PowerShell `Get-NetRoute` and maps it to a tshark device path. On Windows, adapter name lookups decode output as explicit UTF-8 to support non-English locales. |
-| Task queue | `api/task_queue.py`, `api/tasks.py` | Redis URL from `ADNS_REDIS_URL`. RQ queue name defaults to `flow_scores`. `score_flow_batch` loads flows in chunks (`ADNS_SCORING_FETCH_CHUNK`), skips already scored IDs, and writes `Prediction` rows within app context. |
-| Worker | `api/worker.py` | RQ worker bootstrap; set `ADNS_RQ_QUEUE`, `ADNS_REDIS_URL`, `ADNS_RQ_JOB_TIMEOUT` as needed. Uses the same DB URI as the API (`SQLALCHEMY_DATABASE_URI` default/local). Adds optional reverse-DNS enrichment (`ADNS_RDNS_ENABLED`, timeout/cache tunables) before scoring. |
-| Detection engine | `api/model_runner.py`, `api/scoring.py` | Combines lightweight flow pipeline and ExtraTrees/XGBoost meta bundle. Builds synthesized features from `Flow.extra` when packet metadata is sparse. Batch flows supply real duration, directional bytes, and packet counts, reducing train/serve skew. |
-| Frontend | `frontend/adns-frontend/` | React/Vite dashboard with five tabs: Dashboard, Flows Manager, Batch Analysis, Simulate, Settings. Batch Analysis tab polls `GET /batch_summary?window=10m|15m|1h` every 15 s. Settings tab shows read-only capture indicators: detected interface, tshark status, live capture (running/flows/last packet), batch capture (running/batches/last batch) — no manual interface selector or start/stop controls. Build output served from `dist/` via Nginx. Uses optional `VITE_API_URL`; defaults to relative `/api/*`. |
-| Deployment + ops | `deployment/`, `worker/`, `assets/` | Empty placeholders in the repo; no systemd/nginx assets are checked in. Production services live under `/var/www/adns/...` on the host per the notes below. |
-| Data + ML lab | `data/`, `outputs/`, `ml/`, `docs/` | Raw datasets (e.g., UNSW-NB15) and zips sit in `data/` (gitignored). Derived CSVs/models in `outputs/` (gitignored). Preprocessing + training scripts in `ml/`, notebooks/research notes in `docs/`. |
+| Live capture agent | `agent/capture.py` | Wraps `tshark` (fields in `TSHARK_FIELDS`), infers ports/services, batches ~50 flows or ~2 s, retries POSTs with backoff. Settings read from env (`API_URL`, `TSHARK_BIN`, `INTERFACE`, `BATCH_SIZE`, `POST_INTERVAL`, `RETRY_DELAY`) with defaults. In the desktop installer this runs as `_CaptureAgent` embedded inside the API process. |
+| Batch capture agent | `agent/batch_capture.py` | Standalone script for server/dev use. In the desktop installer the same logic runs as `_BatchCaptureAgent` embedded inside the API process (started automatically on launch). Env: `INTERFACE`, `TSHARK_BIN`, `BATCH_WINDOW_SECONDS` (default 15), `BATCH_DIR`, `BATCH_API_URL`. Each 15-second window produces one pcap; two-pass tshark processing extracts flows. **Requires tshark 4.x**: conv output has no pipe chars in data rows and uses human-readable byte units (`85 kB`, `1530 bytes`); `_BATCH_CONV_RE` and `_parse_tshark_bytes` in `app.py` handle this. |
+| API | `api/app.py` | Flask + SQLAlchemy. Key routes: `/health`, `/ingest`, `/ingest_batch`, `/flows`, `/anomalies`, `/anomalous_flows`, `/simulate`, `/batch_summary`, `/capture_status`, `/interfaces`, `/capture/autostart`, `/block_ip`, `/unblock_ip`, `/killswitch`, `/model_status`. `_BatchCaptureAgent` and `_CaptureAgent` classes run in-process; auto-started by the launcher. |
+| Task queue | `api/task_queue.py`, `api/tasks.py` | In-process `ThreadPoolExecutor` (default 2 workers, `ADNS_SCORER_WORKERS`). `enqueue_flow_scoring(flow_ids)` splits IDs into 100-ID chunks and submits each to the pool. `score_flow_batch` in `tasks.py` runs inside an explicit Flask app context, optionally enriches with reverse-DNS, and upserts `Prediction` rows. No Redis or external queue required. |
+| Detection engine | `api/model_runner.py`, `api/scoring.py` | Three-tier cascade: MetaEnsembleModel (ExtraTrees+XGBoost, `meta_model_combined.joblib`) → FlowModel (calibrated LogisticRegression, `flow_detector.joblib`) → heuristic FlowScorer. Hot-reloads on artifact mtime change. Feature synthesis in `MetaFeatureBuilder` fills the ~46-column vector from sparse live tshark telemetry. |
+| Frontend | `frontend/adns-frontend/` | React/Vite dashboard with five tabs: **Dashboard** (metric cards + four charts), **Flows** (filterable flow table with per-row block action), **Flows Manager** (anomalous flows + blocked IPs), **Batch Analysis** (15-min pcap-based summaries), **Settings** (capture pipeline status, model health). Kill switch stays in the top header. Build output served from `dist/` (embedded in the desktop bundle). |
+| Desktop launcher | `launcher.py` | PyInstaller entry point. Elevates to admin if needed, installs Npcap if absent, starts Flask in a background thread, waits for `/health`, then opens a pywebview window. Tray icon: left-click to show, right-click → Quit runs `os._exit(0)` after stopping tshark. |
+| Desktop build | `ADNS.spec`, `installer.iss`, `scripts/build_installer.ps1` | PyInstaller spec bundles Flask, React dist, ML models, tshark binaries, and all Python deps (including `collect_all("xgboost")` + explicit native DLL). Inno Setup wraps to a single installer. Build script auto-kills any running ADNS process before PyInstaller runs so `dist/ADNS/` is not locked. Run: `pwsh scripts\build_installer.ps1` (or with `-Version X.Y.Z`). |
+| Data + ML lab | `data/`, `outputs/`, `ml/`, `docs/` | Raw datasets (e.g., UNSW-NB15, TON_IoT) in `data/` (gitignored). Derived CSVs/models in `outputs/` (gitignored). Preprocessing + training scripts in `ml/`, notebooks in `docs/`. |
 
 ## Key Runtime Details
-- **Endpoints**:
-  - Flask routes are `/health`, `/ingest`, `/ingest_batch`, `/flows`, `/anomalies`, `/simulate`, `/batch_summary`, `/capture_status`, `/capture/autostart`, `/interfaces`, `/agent/status`, `/block_ip`, `/unblock_ip`; Nginx maps them to `/api/*` for the frontend.
-  - `POST /ingest` (list or single flow) -> writes `Flow` rows with `source='live'`, enforces live retention, enqueues scoring (with inline fallback on failure).
-  - `POST /ingest_batch` (list of flows) -> writes `Flow` rows with `source='batch'`, enqueues scoring, enforces 65-min batch retention independently.
-  - `GET /batch_summary?window=10m|15m|1h` -> total_flows, total_bytes, anomaly_count, anomaly_rate, proto_breakdown, top_src_ips (by flows), top_dst_ips (by bytes), bucketed timeseries, last_batch_received.
-  - `POST /capture/autostart` -> detects default-route interface via PowerShell `Get-NetRoute`, starts live and batch capture agents; called automatically by the launcher on startup.
-  - `GET /capture_status` -> combined status for both capture agents: detected interface name, tshark found, live (running/flows/last ingest/uptime/error), batch (running/batches/last batch/uptime/error).
-  - `GET /flows` -> last `MAX_FLOWS` live rows (excludes `source='batch'`) ordered oldest-first; falls back to canned demo flows when DB empty.
-  - `GET /anomalies` -> simple stats derived from current live buffer (count, max score, pct > 0.9) or demo stats.
-  - `POST /simulate` -> generates synthetic flows (botnet flood, data exfiltration, port scan) and scores inline with `DetectionEngine`.
-- **Database**: DSN defaults to `postgresql://adns:adns_password@127.0.0.1/adns` but can be overridden via `SQLALCHEMY_DATABASE_URI`. Tables: `flows` (timestamp/src/dst/proto/bytes/extra JSON) and `predictions` (flow_id unique, score, label, created_at). `init_db()` creates tables, ensures `flows.extra`, and adds a unique index on `predictions.flow_id`, pruning duplicates if needed.
-- **Queues**: Redis defaults to `redis://127.0.0.1:6379/0`. Queue names, batch size, fetch chunk, and timeouts are configurable via env (`ADNS_RQ_QUEUE`, `ADNS_RQ_BATCH_SIZE`, `ADNS_SCORING_FETCH_CHUNK`, `ADNS_RQ_JOB_TIMEOUT`).
-- **Agent expectations**: Requires `/usr/bin/tshark`, runs with privileges on `eth0`, posts JSON that already includes inferred service + HTTP/DNS metadata so the API can stash it in `flows.extra`. Tuning is via env (`API_URL`, `INTERFACE`, `BATCH_SIZE`, timing knobs).
-- **Reverse DNS feature**: `tasks.score_flow_batch` can optionally add `rdns_exists`/`rdns_hash` to flow extras before scoring, using a cached reverse lookup on the peer IP. Control via `ADNS_RDNS_ENABLED` (default true), `ADNS_RDNS_TIMEOUT_MS`, `ADNS_RDNS_CACHE_TTL`, `ADNS_RDNS_CACHE_SIZE`.
-- **Retention**: Live flows controlled by `ADNS_FLOW_RETENTION_MINUTES` (default 30) and `ADNS_FLOW_RETENTION_MAX_ROWS` (default 5000). Batch flows have a separate 65-min retention (`ADNS_BATCH_FLOW_RETENTION_MINUTES`), long enough to cover the 1-hour summary window. Both purge during their respective ingest paths.
+- **Endpoints** (Flask routes; in desktop bundle the `/api` prefix is stripped by `_StripApiPrefix` WSGI middleware):
+  - `POST /ingest` — ingest live flow JSON, enforce retention, enqueue scoring
+  - `POST /ingest_batch` — ingest batch-capture flows (`source='batch'`), enforce 65-min retention
+  - `GET /flows` — last `MAX_FLOWS=400` live flows, oldest-first
+  - `GET /anomalies` — aggregate stats over live buffer
+  - `GET /anomalous_flows` — live flows where label ≠ normal or score ≥ 0.6
+  - `GET /batch_summary?window=10m|15m|1h` — total_flows, total_bytes, anomaly_count, proto_breakdown, top IPs, timeseries
+  - `POST /simulate` — generate + score synthetic attack flows inline (types: attack/scanning/dos/ddos/injection)
+  - `POST /capture/autostart` — detect default-route interface, start both capture agents
+  - `GET /capture_status` — interface, tshark_found, live/batch agent status (running, batches, last ingest, error)
+  - `GET /model_status` — probe each ML estimator with a dummy prediction; reports ok/broken/absent
+  - `POST /block_ip` — OS-level block (requires `ADNS_ADMIN_TOKEN`)
+  - `POST /killswitch` — drop all non-loopback traffic; ungated
+- **Database**: DSN defaults to `postgresql://adns:adns_password@127.0.0.1/adns`; SQLite for dev/desktop. `init_db()` creates tables and runs in-code migrations (adds `flows.extra` column, deduplicates `predictions.flow_id`).
+- **Scoring async**: `ThreadPoolExecutor` — no Redis/RQ. Jobs are in-process; do not survive a restart. Configurable via `ADNS_SCORER_WORKERS` (default 2) and `ADNS_SCORING_BATCH_SIZE` (default 100).
+- **Reverse DNS**: `tasks.score_flow_batch` optionally enriches flows with `rdns_exists`/`rdns_hash`. Control via `ADNS_RDNS_ENABLED` (default true in server; set to false in desktop launcher), `ADNS_RDNS_TIMEOUT_MS`, `ADNS_RDNS_CACHE_TTL`, `ADNS_RDNS_CACHE_SIZE`.
+- **Retention**: Live flows controlled by `ADNS_FLOW_RETENTION_MINUTES` (30) and `ADNS_FLOW_RETENTION_MAX_ROWS` (5000). Batch flows have a separate 65-min retention (`ADNS_BATCH_FLOW_RETENTION_MINUTES`).
+- **tshark version**: The batch conv parser (`_BATCH_CONV_RE`) targets tshark 4.x format — no pipes in data rows, human-readable byte units. The bundled tshark in the installer is from Wireshark 4.x at build time.
 
-## Dev Commands & Checks
-- **API**:
-  ```bash
-  cd api
-  python -m venv .venv && source .venv/bin/activate
-  pip install -r requirements.txt
-  export FLASK_APP=app.py
-  export ADNS_REDIS_URL=${ADNS_REDIS_URL:-redis://127.0.0.1:6379/0}
-  export SQLALCHEMY_DATABASE_URI=${SQLALCHEMY_DATABASE_URI:-postgresql://adns:adns_password@127.0.0.1/adns}
-  flask run  # serves /health on 5000
-  ```
-- **Worker**: `source api/.venv/bin/activate && python api/worker.py` (honors `ADNS_REDIS_URL`, `ADNS_RQ_QUEUE`, `ADNS_RQ_JOB_TIMEOUT`; DB URI comes from `SQLALCHEMY_DATABASE_URI` or defaults).
-- **Live capture agent**: `cd agent && python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && sudo ./capture.py`. Override via env (`API_URL`, `INTERFACE`, `BATCH_SIZE`, `POST_INTERVAL`, etc.) when pointing at staging/prod.
-- **Batch capture agent (standalone)**: `python agent/batch_capture.py` (same venv). For server/dev use only — in the desktop installer, batch capture runs embedded in the API process and starts automatically. Key env: `INTERFACE`, `BATCH_WINDOW_SECONDS` (default 15), `BATCH_DIR`, `BATCH_API_URL`, `TSHARK_BIN`.
-- **Frontend**: `cd frontend/adns-frontend && npm install && npm run dev` (hot reload) or `npm run build && npm run preview` for production bundle served via Nginx. `dist/` is deployed to `/root/ADNS/frontend/adns-frontend/dist`. Set `VITE_API_URL` before build if the API isn’t on the same origin.
-- **One-shot local setup**: `./scripts/setup_local.sh` creates `.venv`, installs API/agent deps and frontend node_modules, and copies `.env.example` to `.env` if missing.
-- **ML**: `cd ml && pip install -r requirements.txt` then run preprocess/train scripts (see README for exact commands). Copy resulting `.joblib` files into `api/model_artifacts/`.
-- **Testing**: A `pytest` suite lives in `api/tests/` (run `pip install -r api/requirements-test.txt && cd api && python -m pytest`). It uses a throwaway SQLite DB in heuristic mode — no Redis/PostgreSQL/artifacts needed. CI runs it via `.github/workflows/ci.yml`. For the frontend prefer `npx vitest run`; mock external systems (Redis, PostgreSQL, tshark) in unit tests.
+## Dev Commands (Windows)
+
+**Start Flask dev server** (from `X:\ADNS\api\`):
+```powershell
+& "C:\Users\ruzha\AppData\Local\Programs\Python\Python312\python.exe" -m flask run
+```
+
+**Start frontend dev server** (from `X:\ADNS\frontend\adns-frontend\`):
+```powershell
+npm run dev   # http://localhost:5173 — Vite proxy rewrites /api/* → http://127.0.0.1:5000/*
+```
+
+**Run API tests** (from `X:\ADNS\api\`):
+```powershell
+& "C:\Users\ruzha\AppData\Local\Programs\Python\Python312\python.exe" -m pytest
+```
+Uses throwaway SQLite + heuristic scorer — no PostgreSQL, Redis, or ML artifacts needed.
+
+**Run the desktop bundle directly** (after building):
+```
+X:\ADNS\dist\ADNS\ADNS.exe
+```
+
+**Build installer**:
+```powershell
+pwsh scripts\build_installer.ps1              # auto-increments patch version
+pwsh scripts\build_installer.ps1 -Version 1.2.3  # explicit version (not yet wired; set VERSION file manually)
+```
+Output: `X:\ADNS\Output\ADNS_Installer_v<version>.exe`
+
+**Live tshark capture agent** (real traffic, must run as Administrator):
+```powershell
+$env:INTERFACE = "Wi-Fi"
+$env:API_URL = "http://127.0.0.1:5000/ingest"
+& "C:\Users\ruzha\AppData\Local\Programs\Python\Python312\python.exe" X:\ADNS\agent\capture.py
+```
+
+**Attack simulation** (stdlib CLI, no Flask deps):
+```powershell
+& "C:\Users\ruzha\AppData\Local\Programs\Python\Python312\python.exe" X:\ADNS\core\attack_generator.py --type ddos --count 80
+& "C:\Users\ruzha\AppData\Local\Programs\Python\Python312\python.exe" X:\ADNS\core\attack_generator.py --type injection --duration 120 --interval 1
+```
+Supported types: `attack`, `scanning`, `dos`, `ddos`, `injection`.
 
 ## Operational Notes
-- Production services live under `/var/www/adns/api/app.py` (Gunicorn on 127.0.0.1:5000; Nginx proxies `/api/*`) and `/var/www/adns/agent/capture.py`. The frontend bundle is served from `/root/ADNS/frontend/adns-frontend/dist` by Nginx at `http://159.203.105.167/`.
-- No deployment assets (systemd/nginx units) are tracked in this repo; manage existing units on the host directly (`adns.service`, `adns-worker.service`, `adns-agent.service` if present).
-- Secrets/DSNs live in `.env` (gitignored). Rotate any placeholder passwords before sharing images or demos.
-- When changing schema or models, run `init_db()` (or migrate) before restarting Gunicorn/RQ so `/ingest` never sees missing columns. Restart the worker after updating model artifacts so the DetectionEngine reloads them.
-- **After any implementation change**: restart the relevant service(s) you touched (e.g., `adns.service`, `adns-worker.service`, `adns-agent.service`, or reload the frontend via Nginx) and update/push the GitHub repo so deployment matches source.
-- **Git access**: an SSH key is available for pushes; fingerprint `SHA256:+rRkOHASSedkJHfy85SEJEhjs8k7JnpKYybLWGFGM6A`.
+- In the desktop bundle, the database lives at `%APPDATA%\ADNS\adns.db` and persists across reinstalls.
+- The app self-elevates to admin on startup (required for raw-socket capture and firewall rules via Npcap).
+- Secrets/DSNs live in `.env` (gitignored). Rotate placeholder passwords before sharing.
+- No `api/worker.py` — the RQ worker was removed when scoring moved to `ThreadPoolExecutor` (see ADR-0002).
+- **Git**: repo is at `github.com/OffensiveGeneric/ADNS`.
