@@ -28,7 +28,7 @@ from adns_flows import (
 )
 from adns_flows.extract import find_tshark
 
-from corpus.build_corpus import extract_pcap_flows
+from corpus.build_corpus import extract_pcap_flows, run_pass_b_chunked
 
 
 # ── shared conv fixture ────────────────────────────────────────────────────
@@ -244,3 +244,27 @@ def test_prefer_src_flips_directional_cols_not_totals(parity_pcap_path):
     assert flow_default.dst_bytes == flow_flipped.src_bytes
     assert flow_default.src_pkts  == flow_flipped.dst_pkts
     assert flow_default.dst_pkts  == flow_flipped.src_pkts
+
+
+@tshark_only
+def test_chunked_pass_b_equals_single_pass(parity_pcap_path):
+    """run_pass_b_chunked must produce identical flag counts to a single-pass run.
+
+    Chunk size 1 forces every packet into its own chunk, maximally stressing
+    the merge logic.  The merged result must exactly match the single-pass
+    result because each packet appears in exactly one chunk and flag counts
+    are additive across orientation_key.
+    """
+    from adns_flows.extract import run_pass_b as _run_pass_b_direct
+
+    single = _run_pass_b_direct(_TSHARK, pcap=str(parity_pcap_path))
+    chunked = run_pass_b_chunked(_TSHARK, parity_pcap_path, chunk_size=1)
+
+    # Normalize: sort flag dict keys for comparison
+    def _norm(d):
+        return {k: dict(sorted(v.items())) for k, v in d.items()}
+
+    assert _norm(chunked) == _norm(single), (
+        f"Chunked pass B diverged from single pass.\n"
+        f"single={single}\nchunked={chunked}"
+    )

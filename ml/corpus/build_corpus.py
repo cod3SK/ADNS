@@ -69,11 +69,15 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import struct
+import subprocess as _sp
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from adns_flows import (
@@ -98,9 +102,15 @@ OUTPUT_COLUMNS: list[str] = (
 )
 
 # Drop reason keys — used in CorpusStats.dropped_reasons
-REASON_NO_TIMESTAMP    = "no_timestamp"
-REASON_EXTRACTION_FAIL = "extraction_fail"
-REASON_OTHER           = "other"
+REASON_NO_TIMESTAMP         = "no_timestamp"
+REASON_EXTRACTION_FAIL      = "extraction_fail"
+REASON_FLAGS_UNEXTRACTABLE  = "flags_unextractable"
+REASON_OTHER                = "other"
+
+# Default per-source-IP cap on degenerate one-sided flood flows
+# (src_pkts<=1, dst_pkts==0). Limits trivial-shape dominance in the corpus
+# while preserving a representative sample of each flood source's traffic.
+DEFAULT_FLOOD_CAP = 3_000
 
 # Warning threshold: if this fraction of attack rows matched nothing, warn.
 UNMATCHED_WARN_FRAC = 0.20
@@ -312,6 +322,162 @@ def extract_pcap_flows(
     """
     pcap = str(pcap_path)
     return run_pass_a(tshark_bin, pcap=pcap), run_pass_b(tshark_bin, pcap=pcap)
+
+
+# ── pass-B chunking helpers ────────────────────────────────────────────────
+
+def _find_editcap(tshark_bin: str) -> str:
+    """Return editcap path from the same Wireshark install as tshark."""
+    tshark_dir = Path(tshark_bin).parent
+    for name in ("editcap.exe", "editcap"):
+        candidate = tshark_dir / name
+        if candidate.is_file():
+            return str(candidate)
+    raise FileNotFoundError(
+        f"editcap not found alongside tshark at {tshark_dir}"
+    )
+
+
+def _editcap_env(tshark_bin: str) -> dict:
+    """Env dict for editcap subprocess — mirrors adns_flows extract._tshark_env."""
+    env = os.environ.copy()
+    tshark_dir = os.path.dirname(os.path.abspath(tshark_bin))
+    env["PATH"] = tshark_dir + os.pathsep + env.get("PATH", "")
+    env.setdefault("WIRESHARK_RUN_FROM_BUILD_DIRECTORY", "0")
+    return env
+
+
+def _merge_flag_counts(
+    merged: dict[tuple, dict[str, int]],
+    chunk: dict[tuple, dict[str, int]],
+) -> None:
+    """Add chunk flag counts into merged in-place (sum per flag per key)."""
+    for key, counts in chunk.items():
+        if key not in merged:
+            merged[key] = dict(counts)
+        else:
+            for flag, n in counts.items():
+                merged[key][flag] = merged[key].get(flag, 0) + n
+
+
+def run_pass_b_chunked(
+    tshark_bin: str,
+    pcap_path: str | Path,
+    *,
+    chunk_size: int = 500_000,
+    editcap_timeout: int = 600,
+    chunk_timeout_window: int = 90,
+) -> dict[tuple, dict[str, int]]:
+    """Run pass B by splitting pcap into chunks of chunk_size packets.
+
+    Uses editcap to split, then runs run_pass_b on each chunk and sums flag
+    counts.  The result is mathematically identical to a single-pass run:
+    each packet appears in exactly one chunk; orientation_key is symmetric so
+    counts aggregate correctly across chunks.
+
+    Parameters
+    ----------
+    tshark_bin          : absolute path to tshark
+    pcap_path           : PCAP to process
+    chunk_size          : max packets per chunk (default 500 000)
+    editcap_timeout     : seconds to allow editcap to split the file
+    chunk_timeout_window: window_sec passed to run_pass_b; timeout becomes
+                          max(chunk_timeout_window+30, 90) seconds per chunk
+
+    Raises
+    ------
+    RuntimeError   if editcap produces no chunk files
+    subprocess.TimeoutExpired / OSError  propagated from run_pass_b
+    """
+    editcap = _find_editcap(tshark_bin)
+    pcap_path = Path(pcap_path)
+    env = _editcap_env(tshark_bin)
+    popen_kw: dict = dict(env=env, cwd=str(Path(editcap).parent))
+    if sys.platform == "win32":
+        popen_kw["creationflags"] = _sp.CREATE_NO_WINDOW
+
+    with tempfile.TemporaryDirectory() as tmp:
+        chunk_stem = os.path.join(tmp, "chunk_.pcap")
+
+        # editcap -c N in.pcap chunk_.pcap → chunk__00001.pcap, chunk__00002.pcap …
+        _sp.run(
+            [editcap, "-c", str(chunk_size), str(pcap_path), chunk_stem],
+            capture_output=True,
+            timeout=editcap_timeout,
+            **popen_kw,
+        )
+
+        chunk_files = sorted(Path(tmp).glob("chunk_*.pcap"))
+        if not chunk_files:
+            raise RuntimeError(
+                f"editcap produced no chunk files for {pcap_path.name}"
+            )
+
+        log.info(
+            "  chunked pass B: %d chunks  (chunk_size=%d) for %s",
+            len(chunk_files), chunk_size, pcap_path.name,
+        )
+
+        merged: dict[tuple, dict[str, int]] = {}
+        for chunk in chunk_files:
+            chunk_counts = run_pass_b(
+                tshark_bin, pcap=str(chunk), window_sec=chunk_timeout_window,
+            )
+            _merge_flag_counts(merged, chunk_counts)
+
+        return merged
+
+
+# ── flood-cap sampling ─────────────────────────────────────────────────────
+
+def apply_flood_cap(
+    df: pd.DataFrame,
+    cap: int,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, int]:
+    """Cap degenerate one-sided flood flows per source IP.
+
+    A "degenerate flood flow" satisfies ALL of:
+      - label == 1 (attack)
+      - src_pkts <= 1
+      - dst_pkts == 0
+
+    For each unique src_ip, at most `cap` such flows are retained; the rest
+    are discarded (random sample with fixed `seed` for reproducibility).
+    Non-degenerate flows and benign flows pass through unchanged.
+
+    Returns
+    -------
+    (filtered_df, n_dropped)  where n_dropped is the number of discarded flows.
+    """
+    if cap <= 0:
+        return df, 0
+
+    flood_mask = (df["label"] == 1) & (df["src_pkts"] <= 1) & (df["dst_pkts"] == 0)
+    floods  = df[flood_mask]
+    others  = df[~flood_mask]
+
+    if len(floods) == 0:
+        return df, 0
+
+    rng = np.random.default_rng(seed)
+    keep_idx: list = []
+    for _, group in floods.groupby("src_ip"):
+        idx = group.index.to_numpy()
+        if len(idx) <= cap:
+            keep_idx.extend(idx.tolist())
+        else:
+            keep_idx.extend(rng.choice(idx, size=cap, replace=False).tolist())
+
+    floods_capped = floods.loc[keep_idx]
+    n_dropped = len(floods) - len(floods_capped)
+
+    result = (
+        pd.concat([others, floods_capped])
+        .sort_values(["ts", "src_ip", "src_port", "dst_ip", "dst_port"])
+        .reset_index(drop=True)
+    )
+    return result, n_dropped
 
 
 # ── per-flow label matching ────────────────────────────────────────────────
@@ -703,6 +869,7 @@ def build_corpus_gotham(
     out_parquet: str | Path,
     *,
     allow_skewed: bool = False,
+    flood_cap: int = DEFAULT_FLOOD_CAP,
 ) -> tuple[pd.DataFrame, CorpusStats]:
     """Extract, label, and save a Gotham training corpus.
 
@@ -713,6 +880,9 @@ def build_corpus_gotham(
     out_parquet : output path for the labeled parquet corpus
     allow_skewed: if True, skip the class-balance gate (useful for single-pcap
                   sanity checks where the PCAP is expectedly single-class)
+    flood_cap   : per-source-IP cap on degenerate one-sided flood flows
+                  (src_pkts<=1, dst_pkts==0, label=1).  Set to 0 to disable.
+                  Default DEFAULT_FLOOD_CAP.
 
     Label-row accounting in Gotham mode
     ------------------------------------
@@ -757,34 +927,60 @@ def build_corpus_gotham(
                 spec.pcap_path.name,
             )
 
+        # ── Pass A: conv stats (always needed) ──────────────────────────────
         try:
-            # Large Mirai/Merlin flood PCAPs (2-4 GB) can time out on both passes.
-            # Strategy: attempt standard extraction (90s timeout); if pass A or B
-            # times out, retry pass A alone with a 10-minute timeout (window_sec=600
-            # only affects the subprocess timeout, not the tshark command for pcap
-            # files — see adns_flows/extract.py _source_args).
-            # TCP flag features will be 0 in fallback rows, but flood volume
-            # (bytes/pkts) is still captured — sufficient for DDoS classification.
-            import subprocess as _sp
-            try:
-                conv_dicts, flag_counts = extract_pcap_flows(spec.pcap_path, tshark_bin)
-            except _sp.TimeoutExpired:
-                log.warning(
-                    "%s: tshark timed out (likely large DDoS pcap, %.0f MB) — "
-                    "retrying pass A with 10-min timeout, skipping pass B",
-                    spec.pcap_path.name,
-                    spec.pcap_path.stat().st_size / 1_048_576,
-                )
-                conv_dicts = run_pass_a(
-                    tshark_bin, pcap=str(spec.pcap_path),
-                    window_sec=570,   # gives max(570+30,90)=600s timeout
-                )
-                flag_counts = {}
+            conv_dicts = run_pass_a(
+                tshark_bin, pcap=str(spec.pcap_path),
+                window_sec=570,  # max(570+30, 90) = 600s timeout
+            )
         except Exception as exc:
-            log.warning("tshark failed on %s: %s", spec.pcap_path.name, exc)
+            log.warning(
+                "Pass A failed on %s: %s — dropping PCAP",
+                spec.pcap_path.name, exc,
+            )
             total_stats.n_dropped_unprocessable += 1
             total_stats.dropped_reasons[REASON_EXTRACTION_FAIL] = (
                 total_stats.dropped_reasons.get(REASON_EXTRACTION_FAIL, 0) + 1
+            )
+            continue
+
+        # ── Pass B: TCP flags — try normal → chunked → quarantine ────────
+        # NEVER silently zero-fill.  Fabricated zeros corrupt flag features
+        # and create a capture-size-correlated leak (large DDoS pcaps would
+        # have all flags=0, making them trivially distinguishable from flows
+        # where flags were actually observed).  Any PCAP whose TCP flag counts
+        # cannot be extracted after chunking is quarantined entirely.
+        flags_ok = True
+        try:
+            flag_counts = run_pass_b(tshark_bin, pcap=str(spec.pcap_path))
+        except _sp.TimeoutExpired:
+            size_mb = spec.pcap_path.stat().st_size / 1_048_576
+            log.warning(
+                "%s: pass B timed out (%.0f MB) — trying chunked pass B",
+                spec.pcap_path.name, size_mb,
+            )
+            try:
+                flag_counts = run_pass_b_chunked(tshark_bin, spec.pcap_path)
+                log.info("  chunked pass B completed for %s", spec.pcap_path.name)
+            except Exception as chunk_exc:
+                log.warning(
+                    "%s: chunked pass B also failed (%s) — quarantining "
+                    "all flows as flags_unextractable",
+                    spec.pcap_path.name, chunk_exc,
+                )
+                flags_ok = False
+        except Exception as exc:
+            log.warning(
+                "%s: pass B failed (%s) — quarantining flows",
+                spec.pcap_path.name, exc,
+            )
+            flags_ok = False
+
+        if not flags_ok:
+            n_q = len(conv_dicts)
+            total_stats.n_dropped_unprocessable += n_q
+            total_stats.dropped_reasons[REASON_FLAGS_UNEXTRACTABLE] = (
+                total_stats.dropped_reasons.get(REASON_FLAGS_UNEXTRACTABLE, 0) + n_q
             )
             continue
 
@@ -835,6 +1031,23 @@ def build_corpus_gotham(
         df = df.sort_values(
             ["ts", "src_ip", "src_port", "dst_ip", "dst_port"]
         ).reset_index(drop=True)
+
+    # ── Flood cap ────────────────────────────────────────────────────────────
+    if flood_cap > 0 and len(df) > 0:
+        n_before = len(df)
+        n_att_before = int((df["label"] == 1).sum())
+        df, n_flood_dropped = apply_flood_cap(df, cap=flood_cap)
+        n_att_after = int((df["label"] == 1).sum())
+        log.info(
+            "Flood cap (N=%d/src_ip): dropped %d degenerate flows  "
+            "attack before=%d after=%d  "
+            "total before=%d after=%d",
+            flood_cap, n_flood_dropped,
+            n_att_before, n_att_after,
+            n_before, len(df),
+        )
+        total_stats.n_attack = n_att_after
+        total_stats.n_benign = int((df["label"] == 0).sum())
 
     df.to_parquet(out_parquet, index=False)
     log.info("Wrote %d rows to %s", len(df), out_parquet)
@@ -1140,6 +1353,10 @@ Subcommands
                     help="Path to tshark binary (auto-detected if omitted)")
     ap.add_argument("--allow-skewed", action="store_true",
                     help="Skip class-balance gate (print warning and proceed)")
+    ap.add_argument("--flood-cap", type=int, default=DEFAULT_FLOOD_CAP, metavar="N",
+                    help=f"Per-source-IP cap on one-sided flood flows "
+                         f"(src_pkts<=1, dst_pkts==0). 0=disable. "
+                         f"Default {DEFAULT_FLOOD_CAP}")
     ap.add_argument("--dataset", choices=("unsw", "gotham"), default="unsw",
                     help="Dataset type: 'unsw' (default) or 'gotham'")
     ap.add_argument("--gotham-root", metavar="PATH",
@@ -1187,6 +1404,7 @@ Subcommands
             tshark_bin=tshark,
             out_parquet=args.out,
             allow_skewed=args.allow_skewed,
+            flood_cap=args.flood_cap,
         )
         print(f"Done. {len(df):,} rows -> {args.out}")
         print(f"  n_attack={stats.n_attack}  n_benign={stats.n_benign}  "

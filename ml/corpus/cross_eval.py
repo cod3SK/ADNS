@@ -52,7 +52,12 @@ try:
 except ImportError:
     XGBClassifier = None  # type: ignore[assignment,misc]
 
-from sklearn.metrics import average_precision_score, recall_score
+from sklearn.metrics import (
+    average_precision_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import StratifiedShuffleSplit
 
 
@@ -87,13 +92,16 @@ def _train_xgb(
     return model
 
 
-def _to_xy(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (X, y, attack_cats) for a labeled corpus DataFrame."""
+def _to_xy(
+    df: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (X, y, attack_cats, src_ips) for a labeled corpus DataFrame."""
     feat_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
-    X = df[feat_cols].to_numpy(dtype=np.float32)
-    y = df["label"].to_numpy(dtype=np.int32)
+    X    = df[feat_cols].to_numpy(dtype=np.float32)
+    y    = df["label"].to_numpy(dtype=np.int32)
     cats = df["attack_cat"].fillna("").to_numpy(dtype=str)
-    return X, y, cats
+    ips  = df["src_ip"].to_numpy(dtype=str)
+    return X, y, cats, ips
 
 
 # ── per-attack-cat recall ──────────────────────────────────────────────────
@@ -141,7 +149,45 @@ def _benign_fpr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return round(float(false_positives / max(false_positives + true_negatives, 1)), 4)
 
 
+def _per_host_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    src_ips: np.ndarray,
+) -> dict:
+    """Per-source-host attacker recall and benign-host false-positive rate.
+
+    A flood generates millions of flows from a single host.  A deployable
+    detector cares whether it caught the *host*, not just scored each SYN.
+
+    attacker_host_recall : fraction of attacking src_ips with >=1 flow flagged
+    benign_host_fpr      : fraction of benign src_ips with >=1 flow flagged
+    """
+    attacker_caught: list[bool] = []
+    benign_flagged:  list[bool] = []
+
+    for ip in np.unique(src_ips):
+        mask = src_ips == ip
+        if y_true[mask].any():
+            attacker_caught.append(bool(y_pred[mask].any()))
+        else:
+            benign_flagged.append(bool(y_pred[mask].any()))
+
+    return {
+        "attacker_host_recall": round(
+            float(sum(attacker_caught) / max(len(attacker_caught), 1)), 4,
+        ),
+        "benign_host_fpr": round(
+            float(sum(benign_flagged) / max(len(benign_flagged), 1)), 4,
+        ),
+        "n_attacker_hosts": len(attacker_caught),
+        "n_benign_hosts":   len(benign_flagged),
+    }
+
+
 # ── evaluation block ───────────────────────────────────────────────────────
+
+_THRESHOLD = 0.5  # fixed operating threshold for precision/recall reporting
+
 
 def _evaluate(
     X_train: np.ndarray,
@@ -152,13 +198,20 @@ def _evaluate(
     train_label: str,
     test_label: str,
     seed: int = 42,
+    test_src_ips: np.ndarray | None = None,
 ) -> dict:
     """Train on (X_train, y_train), evaluate on (X_test, y_test).
 
     Returns a dict with:
-      pr_auc            : PR-AUC on test set
+      pr_auc            : PR-AUC on test set (use with prevalence — see below)
+      prevalence        : positive-class fraction in test set (trivial-baseline)
+      precision_at_t    : precision at THRESHOLD (default 0.5)
+      recall_at_t       : recall at THRESHOLD
+      threshold         : the fixed threshold used
       benign_fpr        : false-positive rate among true-benign test flows
       per_cat_recall    : dict[attack_cat -> recall] + '_overall_attack'
+      host_metrics      : per-source-host attacker recall + benign host FPR
+                          (only if test_src_ips is provided)
       n_train / n_test  : split sizes
       train_label       : identifier string for the training set
       test_label        : identifier string for the test set
@@ -169,21 +222,36 @@ def _evaluate(
             "Check corpus balance."
         )
 
-    model = _train_xgb(X_train, y_train, seed=seed)
+    model  = _train_xgb(X_train, y_train, seed=seed)
     y_prob = model.predict_proba(X_test)[:, 1]
-    y_pred = (y_prob >= 0.5).astype(np.int32)
+    y_pred = (y_prob >= _THRESHOLD).astype(np.int32)
 
-    pr_auc = float(average_precision_score(y_test, y_prob)) if len(np.unique(y_test)) > 1 else float("nan")
+    n_pos      = int(y_test.sum())
+    prevalence = float(n_pos) / max(len(y_test), 1)
+    pr_auc = (
+        float(average_precision_score(y_test, y_prob))
+        if len(np.unique(y_test)) > 1 else float("nan")
+    )
+    prec = float(precision_score(y_test, y_pred, pos_label=1, zero_division=0))
+    rec  = float(recall_score(y_test, y_pred, pos_label=1, zero_division=0))
 
-    return {
-        "train_label":     train_label,
-        "test_label":      test_label,
-        "pr_auc":          round(pr_auc, 4),
-        "benign_fpr":      _benign_fpr(y_test, y_pred),
-        "per_cat_recall":  _per_cat_recall(y_test, y_pred, test_cats),
-        "n_train":         len(X_train),
-        "n_test":          len(X_test),
+    result = {
+        "train_label":      train_label,
+        "test_label":       test_label,
+        "n_train":          len(X_train),
+        "n_test":           len(X_test),
+        "prevalence":       round(prevalence, 4),
+        "threshold":        _THRESHOLD,
+        "pr_auc":           round(pr_auc, 4),
+        "precision_at_t":   round(prec, 4),
+        "recall_at_t":      round(rec, 4),
+        "benign_fpr":       _benign_fpr(y_test, y_pred),
+        "per_cat_recall":   _per_cat_recall(y_test, y_pred, test_cats),
     }
+    if test_src_ips is not None:
+        result["host_metrics"] = _per_host_metrics(y_test, y_pred, test_src_ips)
+
+    return result
 
 
 # ── feature distribution diagnostic ───────────────────────────────────────
@@ -263,8 +331,8 @@ def run_cross_eval(
     df_unsw   = pd.read_parquet(unsw_path)
     df_gotham = pd.read_parquet(gotham_path)
 
-    X_u, y_u, cats_u = _to_xy(df_unsw)
-    X_g, y_g, cats_g = _to_xy(df_gotham)
+    X_u, y_u, cats_u, ips_u = _to_xy(df_unsw)
+    X_g, y_g, cats_g, ips_g = _to_xy(df_gotham)
 
     # (A) In-domain Gotham — 80/20 stratified split
     sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
@@ -273,6 +341,7 @@ def run_cross_eval(
         X_g[tr_g], y_g[tr_g],
         X_g[te_g], y_g[te_g], cats_g[te_g],
         train_label="Gotham (80%)", test_label="Gotham (20%)", seed=seed,
+        test_src_ips=ips_g[te_g],
     )
 
     # (B) Cross-domain: UNSW → Gotham
@@ -280,6 +349,7 @@ def run_cross_eval(
         X_u, y_u,
         X_g, y_g, cats_g,
         train_label="UNSW (full)", test_label="Gotham (full)", seed=seed,
+        test_src_ips=ips_g,
     )
 
     # (B) Cross-domain: Gotham → UNSW
@@ -287,12 +357,14 @@ def run_cross_eval(
         X_g, y_g,
         X_u, y_u, cats_u,
         train_label="Gotham (full)", test_label="UNSW (full)", seed=seed,
+        test_src_ips=ips_u,
     )
 
     # (C) Pooled — 80/20 stratified split on combined corpus
-    X_pool = np.vstack([X_u, X_g])
-    y_pool = np.concatenate([y_u, y_g])
+    X_pool    = np.vstack([X_u, X_g])
+    y_pool    = np.concatenate([y_u, y_g])
     cats_pool = np.concatenate([cats_u, cats_g])
+    ips_pool  = np.concatenate([ips_u, ips_g])
 
     sss_p = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
     tr_p, te_p = next(sss_p.split(X_pool, y_pool))
@@ -300,6 +372,7 @@ def run_cross_eval(
         X_pool[tr_p], y_pool[tr_p],
         X_pool[te_p], y_pool[te_p], cats_pool[te_p],
         train_label="UNSW+Gotham (80%)", test_label="UNSW+Gotham (20%)", seed=seed,
+        test_src_ips=ips_pool[te_p],
     )
 
     # (Step 4) Feature distribution comparison
@@ -317,14 +390,26 @@ def run_cross_eval(
 # ── pretty-printer ─────────────────────────────────────────────────────────
 
 def _print_eval_block(label: str, result: dict) -> None:
+    t = result.get("threshold", _THRESHOLD)
+    prevalence = result.get("prevalence", float("nan"))
     print(f"\n{'='*60}")
     print(f"  {label}")
     print(f"  train={result['train_label']}  test={result['test_label']}")
     print(f"  n_train={result['n_train']:,}  n_test={result['n_test']:,}")
     print(f"{'='*60}")
+    print(f"  Prevalence      : {prevalence:.4f}  "
+          f"(trivial always-attack baseline PR-AUC)")
     print(f"  PR-AUC          : {result['pr_auc']:.4f}")
+    print(f"  Precision @{t}  : {result.get('precision_at_t', float('nan')):.4f}")
+    print(f"  Recall    @{t}  : {result.get('recall_at_t', float('nan')):.4f}")
     print(f"  Benign FPR      : {result['benign_fpr']:.4f}  "
           f"(fraction of true-benign flows flagged as attack)")
+    hm = result.get("host_metrics")
+    if hm:
+        print(f"  Attacker-host recall : {hm['attacker_host_recall']:.4f}  "
+              f"({hm['n_attacker_hosts']} attacking src_ips)")
+        print(f"  Benign-host FPR      : {hm['benign_host_fpr']:.4f}  "
+              f"({hm['n_benign_hosts']} benign src_ips)")
     print(f"\n  Per-attack-cat recall:")
     cats = result["per_cat_recall"]
     overall = cats.pop("_overall_attack", None)
@@ -406,9 +491,12 @@ distribution comparison table.
         print(f"Loading Gotham corpus: {args.gotham}")
         print("(--unsw not provided; running config A in-domain only)")
         df_gotham = pd.read_parquet(args.gotham)
-        X_g, y_g, cats_g = _to_xy(df_gotham)
+        X_g, y_g, cats_g, ips_g = _to_xy(df_gotham)
+        n_attack = int(y_g.sum())
+        n_benign = len(y_g) - n_attack
         print(f"  Gotham: {len(X_g):,} rows  "
-              f"(attack={int(y_g.sum()):,}  benign={(y_g==0).sum():,})")
+              f"(attack={n_attack:,}  benign={n_benign:,}  "
+              f"prevalence={n_attack/max(len(y_g),1):.3f})")
         sss = StratifiedShuffleSplit(
             n_splits=1, test_size=args.test_size, random_state=args.seed,
         )
@@ -417,6 +505,7 @@ distribution comparison table.
             X_g[tr_g], y_g[tr_g],
             X_g[te_g], y_g[te_g], cats_g[te_g],
             train_label="Gotham (80%)", test_label="Gotham (20%)", seed=args.seed,
+            test_src_ips=ips_g[te_g],
         )
         _print_eval_block(
             "(A) IN-DOMAIN: train Gotham / test Gotham (ceiling)", result,
