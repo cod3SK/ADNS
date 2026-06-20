@@ -227,35 +227,79 @@ failures re-enter.
 
 **NFStream migration — Phase 0: PASS (2026-06-20)**
 
-The frozen exe fork-bombed on the previous run (WinError 1455, paging file
-exhausted) because `multiprocessing.freeze_support()` was missing.  NFStream uses
-`get_context('spawn')` on Windows and spawns `n_meters` worker processes; without
-`freeze_support()` each worker re-ran `main()` exponentially.
+Frozen exe fork-bomb fixed (`freeze_support()` in `__main__`). Phase 0 results:
+- STEP 3 (pcap): 1 flow, exit 0, orphans 0.
+- STEP 4 (live 90 s): 135 flows, child count exactly 1 for all 18 samples.
+- Serving config: `n_meters=1, n_dissections=0`.
 
-Fix applied (all on `main`, not yet committed):
-- `nfstream_pkg_test.py`: `freeze_support()` as first call in `__main__`, plus
-  `n_meters=1` on every `NFStreamer(...)` call, plus `--mode live` for sustained
-  capture testing.
-- `launcher.py`: same `freeze_support()` guard.
-- `rthook_nfstream.py`: doc updated; freeze_support must NOT go in runtime hooks.
-- `run_frozen_guarded.ps1`: safety guard that kills the process tree if child
-  count exceeds 12 or wall time exceeds timeout (use this before any frozen test).
+All Phase 0 code committed on `feat/nfstream-migration` (commit 67c20b7).
 
-Phase 0 test results (exe at `dist_test/nfstream_pkg_test/nfstream_pkg_test.exe`):
-- **STEP 3 (pcap read)**: 1 flow from synthetic SYN/SYN-ACK pcap. Exit 0, orphans 0.
-- **STEP 4 (live capture 90 s)**: 135 flows, interface
-  `\Device\NPF_{E466F43A-35D6-409B-AC2B-A026C362E238}` (Intel Wi-Fi 6E AX211).
-  Child count: **exactly 1 for all 18 samples across 92 s — never climbed.**
-  Exit 0, orphans 0, guard not triggered.
+**NFStream migration — Phase 1: PASS (2026-06-20)**
 
-**Serving config decided**: `n_meters=1, n_dissections=0` for all frozen NFStream
-calls. This caps the process tree at root + 1 worker.
+NFStream extractor implemented behind the existing feature contract.
+Three new files on `feat/nfstream-migration`:
 
-**What's next — Phase 1**: Migrate `ml/corpus/build_corpus.py` from the tshark
-two-pass + editcap-chunked architecture to NFStream single-pass extraction. All
-46+ corpus tests in `ml/corpus/tests/` must pass with NFStream output.  tshark
-remains the working path for live scoring in `api/app.py`; nothing is removed
-until Phase 1 extraction parity is proven.
+- `ml/adns_flows/nfstream_config.py` — canonical SSoT config (statistical_analysis=True
+  REQUIRED for 6/21 TCP flag features; idle_timeout=120; active_timeout=1800;
+  n_dissections=0; n_meters=1 for serving).
+- `ml/adns_flows/extract_nfstream.py` — single-pass extractor: NFStream's
+  initiator-based src/dst overridden by `canonicalize_orientation()`; directional
+  counts swapped when orientation flips; `validate_matrix()` gates every DataFrame.
+- `ml/adns_flows/tests/test_nfstream_parity.py` — 15 parity tests, all pass:
+  - Hand-fixture: L2 byte counts (src=186/288, scan=54/270, UDP=54/64), flag counts
+    (flow1: syn=2 ack=7 fin=2 psh=2; flow2: syn=5 rst=1), orientation correctness.
+  - Config parity: n_meters=1 vs n_meters=2 → byte-identical on all features.
+  - Determinism: same pcap twice → identical DataFrames.
+  - Orientation invariance: initiator_fwd vs initiator_rev → same canonical src.
+  - Cross-extractor: NFStream and tshark agree on ALL contract features — flag counts
+    AND byte counts (both count Ethernet frame bytes / L2; no per-packet offset).
 
-Detailed migration plan and per-phase gates: `memory/ml_next_steps.md` +
+Phase 1 verdict: **GO** — NFStream extractor is ready for corpus migration.
+
+**NFStream migration — Phase 2: PASS (2026-06-20)**
+
+`ml/corpus/build_corpus.py` migrated from tshark two-pass + editcap-chunked to
+`extract_flows_nfstream()`. tshark path preserved (Phase 6 removal). New CLI
+flags: `--extractor {nfstream,tshark}` (default nfstream), `--n-meters N`.
+
+New files:
+- `ml/corpus/tests/test_labeling_nf.py` — 27 unit tests for NFStream labeling helpers
+  (`_reorient_flow`, `_apply_labels_nf`, `_apply_labels_gotham_nf`,
+  `_apply_labels_cic_nf`). All pass.
+- `ml/run_unsw_day1_nfstream.py`, `ml/run_unsw_day2_nfstream.py` — UNSW build scripts
+  (require `if __name__ == '__main__':` + `freeze_support()` due to NFStream's Windows
+  multiprocessing spawn). Omitting the guard causes silent extraction failure on all PCAPs.
+- `ml/combine_unsw_nfstream.py` — merges day1 + day2 into `unsw_flows_nfstream.parquet`.
+
+Step 2 gate (probe-attack on NFStream output): PASS — UNSW pcap 6 row 8657
+delta_start=+0.007s (in-window). Sanity check on pcap 6: 18,677 flows, 1,218 attack,
+0 dropped — byte-identical to tshark result.
+
+Three-corpus rebuild results (all `*_nfstream.parquet`, tshark corpora untouched):
+
+| Dataset       | NFStream rows | Attack%  | vs tshark rows | vs tshark attack% | Notes |
+|---------------|---------------|----------|----------------|-------------------|-------|
+| CIC Tuesday   | 308,349       | 2.26%    | +45.0%         | -1.01pp           | grain-driven (idle_timeout=120 splits 1745s→17.5s mean flows) |
+| Gotham 2025   | 2,331,227     | 97.05%   | -18.9%         | -1.15pp           | flood cap hits harder on Mirai SYN (more flows/IP → more capped) |
+| UNSW-NB15     | 2,058,890     | 3.22%    | +0.1%          | -0.02pp           | nearly identical (UNSW has short flows; minimal grain effect) |
+
+All deltas are grain-driven (duration mean shifts confirm it), not labeling breaks.
+Determinism check (pcap 6, twice): byte-identical DataFrames. All-zero feature rows: 0.
+All 172 ML suite tests pass (46 labeling + 27 NFStream labeling + 99 adns_flows).
+
+All attack categories preserved across all three datasets.
+
+**What's next — Phase 3**: Migrate live scoring path in `api/app.py` from tshark
+two-pass to `extract_flows_nfstream()`. Goals:
+1. Replace `run_pass_a` / `run_pass_b` tshark calls in live capture loop with
+   `extract_flows_nfstream(source=interface, n_meters=1)`.
+2. Retrain model on NFStream corpora (`unsw_flows_nfstream.parquet`,
+   `gotham_flows_nfstream.parquet`, `cic_tuesday_flows_nfstream.parquet`).
+3. Update `api/model_artifacts/` with retrained model.
+4. Confirm `validate_matrix()` still gates every predict() call.
+5. Run cross-eval on NFStream-trained model.
+
+tshark binary probe order and Npcap dependency unchanged until Phase 3 completes.
+
+Detailed migration plan: `memory/ml_next_steps.md` +
 `memory/nfstream_phase0.md` (Claude auto-memory, loaded at session start).
