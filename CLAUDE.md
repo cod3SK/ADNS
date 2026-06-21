@@ -289,6 +289,57 @@ All 172 ML suite tests pass (46 labeling + 27 NFStream labeling + 99 adns_flows)
 
 All attack categories preserved across all three datasets.
 
+**Label-integrity gate + NFStream cross-eval: PASS (2026-06-20)**
+
+Phase 2 label-integrity gate passed for both high-risk datasets:
+
+*CIC gate (highest risk — +45% rows):*
+- FTP-Patator: 4,002 flows, ALL in-window (100%). Probe: delta_start=+48s.
+- SSH-Patator: 2,979 flows, ALL in-window (100%). Probe: delta_start=+29s.
+- +45% explained: attack +11 (+0.2%), benign +95,633 (+46.5%). Extra rows are
+  benign splits; idle_timeout=120s splits long benign sessions (mean 1,746s→17s).
+  Short brute-force attack flows (FTP/SSH per-attempt connections) are immune.
+
+*Gotham gate (-18.9% rows):*
+- Root cause: UDP flow count difference. TCP mirai_dos nearly identical (+3,224).
+  tshark UDP: 925,160 vs NFStream UDP: 361,009 (−564k). tshark's `conv,udp`
+  counts every amplification-server→victim response as a unique conversation;
+  NFStream tracks fewer UDP flows for the same traffic. Unique 5-tuples:
+  tshark 1,607,658 vs NFStream 1,150,886 (30% fewer tracked).
+- Label integrity: INTACT. All flows from mirai_dos PCAPs are label=1 (PCAP-
+  level, no time windows). Benign grew (+17,745, grain-driven). All 5 attack
+  categories preserved. Core invariant holds: NFStream misses the same UDP
+  flows at training AND serving time — consistent.
+- Flood cap attribution: cap is NOT the cause. Degenerate attack delta is only
+  −2,473. The 557k non-degenerate drop is the UDP tracking difference above.
+
+NFStream cross-eval (logs: `outputs/corpus/cross_eval_nfstream.log`):
+
+| Config | NFStream result | vs tshark-era | Change |
+|--------|-----------------|---------------|--------|
+| A in-domain Gotham | PR-AUC 1.000, recall 99.58%, FPR 0.01% | PR-AUC 1.000, 99.75%, 0.00% | trivial |
+| A in-domain UNSW | PR-AUC 0.9998, recall 99.94%, FPR 0.03% | PR-AUC 0.9999, 99.95%, 0.03% | trivial |
+| B UNSW→Gotham | PR-AUC 0.9764, recall 33.9%, FPR 47.1% | PR-AUC 0.9784, 27.9%, 56.7% | FPR improved |
+| B Gotham→UNSW | PR-AUC 0.3276, recall 72.9%, FPR 43.6% | PR-AUC 0.2801, 93.1%, 84.1% | FPR improved |
+| D pooled | PR-AUC 1.000, recall 99.68%, FPR 0.05% | PR-AUC 1.000, 99.84%, 0.04% | trivial |
+| E1 UNSW+Gotham→CIC | PR-AUC 0.1307, recall 100%, FPR 36.3% | PR-AUC 0.0774, 100%, 50.9% | FPR improved |
+| E2 CIC in-domain | PR-AUC 1.000, recall 100%, FPR 0.00% | PR-AUC 1.000, 100%, 0.00% | identical |
+| E3 pooled all 3 | PR-AUC 1.000, recall 99.66%, FPR 0.05% | PR-AUC 1.000, 99.84%, 0.05% | trivial |
+
+*Findings reproduce (qualitative story unchanged):*
+- Near-perfect in-domain: YES (PR-AUC ≥ 0.9998, FPR ≤ 0.05%)
+- Cross-domain benign-FPR collapse: YES (47–44% vs 57–84% tshark — modestly improved,
+  still fails. FPR improvement is real: shorter NFStream grain makes benign flows
+  more similar across environments. Same root cause: calibration/prevalence mismatch.)
+- Pooling fixes in-pool: YES (D PR-AUC 1.000)
+- E1 (UNSW+Gotham → CIC) fails: YES (FPR 36% — unacceptable, still flags everything)
+- Three-way pool healthy: YES (E3 PR-AUC 1.000, FPR 0.05%)
+
+Domain-shift drivers: same 8 byte/packet features (src_bytes, dst_bytes,
+total_bytes, src_pkts, dst_pkts, total_pkts, src/dst_mean_pkt_size) — unchanged
+from tshark-era. Duration added to the three-way shift table (NFStream grain makes
+it shift across all three corpora).
+
 **What's next — Phase 3**: Migrate live scoring path in `api/app.py` from tshark
 two-pass to `extract_flows_nfstream()`. Goals:
 1. Replace `run_pass_a` / `run_pass_b` tshark calls in live capture loop with
@@ -297,7 +348,7 @@ two-pass to `extract_flows_nfstream()`. Goals:
    `gotham_flows_nfstream.parquet`, `cic_tuesday_flows_nfstream.parquet`).
 3. Update `api/model_artifacts/` with retrained model.
 4. Confirm `validate_matrix()` still gates every predict() call.
-5. Run cross-eval on NFStream-trained model.
+5. E3-trained model is the target (all three corpora pooled).
 
 tshark binary probe order and Npcap dependency unchanged until Phase 3 completes.
 
