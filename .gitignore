@@ -15,6 +15,8 @@ api/instance/
 dist/
 build/
 
+# Model artifacts are tracked via Git LFS (.gitattributes), not ignored.
+
 # Frontend build
 frontend/adns-frontend/dist/
 frontend/adns-frontend/node_modules/

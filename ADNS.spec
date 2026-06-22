@@ -3,30 +3,17 @@
 #   npm run build  (inside frontend/adns-frontend)
 #   pip install -r requirements-desktop.txt
 
-import glob
 import os
 
-# Bundle tshark + its DLLs so the app captures traffic without a separate Wireshark install.
-# Npcap (the packet capture driver) must still be installed on the target machine.
 # Bundle npcap installer if present in repo root (download from https://npcap.com).
+# Npcap (the packet capture driver) must still be installed on the target machine.
 _npcap_datas = []
 _npcap_installer = os.path.join(os.path.abspath("."), "npcap-installer.exe")
 if os.path.isfile(_npcap_installer):
     _npcap_datas.append((_npcap_installer, "."))
 
-_WIRESHARK_DIR = r"C:\Program Files\Wireshark"
-_tshark_datas = []
-if os.path.isdir(_WIRESHARK_DIR):
-    for _f in glob.glob(os.path.join(_WIRESHARK_DIR, "*.dll")):
-        _tshark_datas.append((_f, "tshark"))
-    _tshark_exe = os.path.join(_WIRESHARK_DIR, "tshark.exe")
-    if os.path.isfile(_tshark_exe):
-        _tshark_datas.append((_tshark_exe, "tshark"))
-    _dumpcap_exe = os.path.join(_WIRESHARK_DIR, "dumpcap.exe")
-    if os.path.isfile(_dumpcap_exe):
-        _tshark_datas.append((_dumpcap_exe, "tshark"))
-
 from PyInstaller.utils.hooks import collect_all, collect_data_files
+import importlib.util as _ilu
 
 block_cipher = None
 
@@ -42,20 +29,32 @@ _xgb_lib = os.path.join(os.path.dirname(_xgb.__file__), "lib", "xgboost.dll")
 if os.path.isfile(_xgb_lib) and not any(_xgb_lib == src for src, _ in xgboost_binaries):
     xgboost_binaries.append((_xgb_lib, "xgboost/lib"))
 
+# NFStream: collect Python package + _lib_engine.pyd (CFFI extension at site-packages root).
+# collect_all("nfstream") finds only the Python package — the native .pyd is one level up.
+nfstream_datas, nfstream_binaries_pkg, nfstream_hiddenimports = collect_all("nfstream")
+_lib_engine_spec = _ilu.find_spec("_lib_engine")
+_nfstream_extra_binaries = []
+if _lib_engine_spec and _lib_engine_spec.origin:
+    _nfstream_extra_binaries.append((_lib_engine_spec.origin, "."))
+
 a = Analysis(
     ["launcher.py"],
-    pathex=["api"],          # so 'from app import ...' resolves
-    binaries=sklearn_binaries + webview_binaries + pystray_binaries + xgboost_binaries,
+    pathex=["api", "ml"],    # api: 'from app import ...' resolves; ml: adns_flows package
+    binaries=(sklearn_binaries + webview_binaries + pystray_binaries + xgboost_binaries
+              + nfstream_binaries_pkg + _nfstream_extra_binaries),
     datas=[
         # React production build
         ("frontend/adns-frontend/dist", "dist"),
-        # Trained model artifacts (included if present; app degrades gracefully without them)
+        # Trained model artifacts — REQUIRED for detection.  Absent model blocks
+        # /capture/autostart with HTTP 503 (not silent).  See api/model_runner.py.
+        # nfstream_model.joblib is tracked via Git LFS; run `git lfs pull` after clone.
         ("api/model_artifacts", "model_artifacts"),
         # Flask app source files (all modules in api/)
         ("api/*.py", "api"),
         # App icon (used by the desktop shortcut)
         ("assets/icon.ico", "assets"),
-    ] + sklearn_datas + webview_datas + pystray_datas + xgboost_datas + _tshark_datas + _npcap_datas,
+    ] + sklearn_datas + webview_datas + pystray_datas + xgboost_datas
+      + nfstream_datas + _npcap_datas,
     hiddenimports=[
         # Flask ecosystem
         "flask_cors",
@@ -77,10 +76,32 @@ a = Analysis(
         "pystray._win32",
         "PIL",
         "PIL.Image",
-    ] + sklearn_hiddenimports + webview_hiddenimports + pystray_hiddenimports + xgboost_hiddenimports,
+        # adns_flows shared extractor (ml/adns_flows/ — on pathex, but api/*.py are data
+        # files so PyInstaller won't trace their imports automatically)
+        "adns_flows",
+        "adns_flows.schema",
+        "adns_flows.extract_nfstream",
+        "adns_flows.nfstream_config",
+        "adns_flows.extract",
+        "adns_flows.assemble",
+        # NFStream serving module (api/ data file, imports not auto-traced)
+        "serving_nfstream",
+        # NFStream sub-modules (collect_all may miss lazy-imported ones)
+        "nfstream",
+        "nfstream.streamer",
+        "nfstream.meter",
+        "nfstream.plugin",
+        "nfstream.engine",
+        "nfstream.utils",
+        # multiprocessing spawn protocol (NFStream meter workers use spawn on Windows)
+        "multiprocessing.spawn",
+        "multiprocessing.forkserver",
+        "multiprocessing.popen_spawn_win32",
+    ] + sklearn_hiddenimports + webview_hiddenimports + pystray_hiddenimports
+      + xgboost_hiddenimports + nfstream_hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["pyi_hooks/rthook_nfstream_npcap.py"],
     excludes=[
         "psycopg2",
         "psycopg2_binary",

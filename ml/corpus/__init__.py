@@ -5,8 +5,9 @@ Builds labeled training data from raw network captures, using adns_flows for
 extraction — the same code path as live scoring.
 
 Supports:
-  UNSW-NB15  — time-window label matching against a ground-truth CSV
-  Gotham 2025 — directory-based labeling (no GT CSV; see gotham_labels.py)
+  UNSW-NB15    — time-window label matching against a ground-truth CSV
+  Gotham 2025  — directory-based labeling (no GT CSV; see gotham_labels.py)
+  CIC-IDS2017  — IP+port+time-window matching via cic_labels.py
 """
 from .build_corpus import (
     DEFAULT_FLOOD_CAP,
@@ -14,21 +15,16 @@ from .build_corpus import (
     CorpusStats,
     OUTPUT_COLUMNS,
     REASON_EXTRACTION_FAIL,
-    REASON_FLAGS_UNEXTRACTABLE,
     REASON_NO_TIMESTAMP,
     REASON_OTHER,
     TIME_TOLERANCE,
     UNMATCHED_WARN_FRAC,
-    _apply_labels,
-    _apply_labels_gotham,
     apply_flood_cap,
     assert_sane_balance,
     build_corpus,
     build_corpus_gotham,
-    extract_pcap_flows,
     get_pcap_start_epoch,
     load_label_index,
-    run_pass_b_chunked,
 )
 
 __all__ = [
@@ -37,19 +33,14 @@ __all__ = [
     "CorpusStats",
     "OUTPUT_COLUMNS",
     "REASON_EXTRACTION_FAIL",
-    "REASON_FLAGS_UNEXTRACTABLE",
     "REASON_NO_TIMESTAMP",
     "REASON_OTHER",
     "TIME_TOLERANCE",
     "UNMATCHED_WARN_FRAC",
-    "_apply_labels",
-    "_apply_labels_gotham",
     "apply_flood_cap",
     "assert_sane_balance",
     "build_corpus",
     "build_corpus_gotham",
-    "extract_pcap_flows",
     "get_pcap_start_epoch",
     "load_label_index",
-    "run_pass_b_chunked",
 ]

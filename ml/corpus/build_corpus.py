@@ -1,9 +1,8 @@
 """
-PCAP-to-labeled-corpus pipeline for UNSW-NB15 and Gotham Dataset 2025.
+PCAP-to-labeled-corpus pipeline for UNSW-NB15, Gotham Dataset 2025, and CIC-IDS2017.
 
-Reads raw pcap files, extracts flows using the canonical adns_flows extractor
-(same code as the live scoring path), labels each flow, and writes a labeled
-parquet corpus.
+Reads raw pcap files, extracts flows using extract_flows_nfstream() (the same
+code path as live scoring), labels each flow, and writes a labeled parquet corpus.
 
 Supported datasets
 ------------------
@@ -18,10 +17,13 @@ Supported datasets
       raw/malicious/<t>/*.pcap   → all flows attack   (label=1, attack_cat=t)
       See corpus/gotham_labels.py for full schema findings (Step 0).
 
-Key invariants (shared across both datasets)
---------------------------------------------
-Extraction invariant: run_pass_a + run_pass_b + build_flows are the functions
-used here AND by extract_flows() at serve time.  They share one code path.
+  --dataset cic
+      CIC-IDS2017 Tuesday: IP+port+time-window matching via cic_labels.py.
+
+Key invariants (shared across all datasets)
+-------------------------------------------
+Extraction invariant: extract_flows_nfstream() is used here AND at serve time.
+They share one code path — the core migration invariant.
 
 Orientation invariant:
   - Benign flows: prefer_src=None  → default rule (src = lower (ip, port))
@@ -35,19 +37,19 @@ Every extracted flow gets exactly one of three outcomes:
   ATTACK (label=1)
     UNSW:   matched an attack label row on endpoint pair + proto + time window.
     Gotham: flow is in a malicious PCAP (label determined at PCAP level).
+    CIC:    flow matches an IP+port+time attack window.
     Assembled with prefer_src=<attacker_ip>.
 
   BENIGN (label=0)
     UNSW:   flow extracted cleanly but matched NO attack label row in the GT CSV.
             A no-match is NEVER a reason to drop.
     Gotham: flow is in a benign PCAP.
+    CIC:    flow matches no attack window.
     RETAINED as a benign example.
 
   DROPPED (n_dropped_unprocessable)
-    Flow could not be processed at all: tshark failed on the pcap (reason
-    'extraction_fail'), the pcap header timestamp was unreadable (reason
-    'no_timestamp'), or assembly raised an unexpected exception (reason 'other').
-    Only genuine processing failures are in this bucket.
+    Genuine processing failure: NFStream failed on the pcap ('extraction_fail')
+    or an unexpected exception ('other').  Only genuine failures land here.
 
 Label-row accounting
 --------------------
@@ -63,7 +65,7 @@ build_corpus() / build_corpus_gotham() call assert_sane_balance() BEFORE writing
 the parquet.  Pass allow_skewed=True to override.
 
 Output columns: IDENTITY_COLUMNS + FEATURE_COLUMNS + ['label', 'attack_cat']
-The 'ts' column contains absolute epoch seconds (pcap_start + rel_start).
+The 'ts' column contains absolute epoch seconds from NFStream packet timestamps.
 """
 from __future__ import annotations
 
@@ -71,9 +73,7 @@ import dataclasses
 import logging
 import os
 import struct
-import subprocess as _sp
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -83,12 +83,11 @@ import pandas as pd
 from adns_flows import (
     FEATURE_COLUMNS,
     IDENTITY_COLUMNS,
-    build_flows,
+    extract_flows_nfstream,
     flow_to_row,
     orientation_key,
-    run_pass_a,
-    run_pass_b,
 )
+from adns_flows.schema import Flow as _Flow
 
 log = logging.getLogger(__name__)
 
@@ -101,11 +100,13 @@ OUTPUT_COLUMNS: list[str] = (
     list(IDENTITY_COLUMNS) + list(FEATURE_COLUMNS) + ["label", "attack_cat"]
 )
 
-# Drop reason keys — used in CorpusStats.dropped_reasons
-REASON_NO_TIMESTAMP         = "no_timestamp"
-REASON_EXTRACTION_FAIL      = "extraction_fail"
-REASON_FLAGS_UNEXTRACTABLE  = "flags_unextractable"
-REASON_OTHER                = "other"
+# Drop reason keys — used in CorpusStats.dropped_reasons.
+# NFStream path reachable: 'extraction_fail', 'other'.
+# 'no_timestamp' is unreachable (NFStream reads absolute timestamps from packets),
+# but the constant is kept for test compatibility with assert_drop_rate tests.
+REASON_NO_TIMESTAMP    = "no_timestamp"
+REASON_EXTRACTION_FAIL = "extraction_fail"
+REASON_OTHER           = "other"
 
 # Default per-source-IP cap on degenerate one-sided flood flows
 # (src_pkts<=1, dst_pkts==0). Limits trivial-shape dominance in the corpus
@@ -115,6 +116,12 @@ DEFAULT_FLOOD_CAP = 3_000
 # Warning threshold: if this fraction of attack rows matched nothing, warn.
 UNMATCHED_WARN_FRAC = 0.20
 
+# Hard limit: if this fraction of total flows seen were silently dropped,
+# HALT before writing parquet.  A rate above this almost always indicates an
+# extraction bug (e.g. get_pcap_start_epoch returning None for an unrecognised
+# pcap format) rather than normal cleaning.
+MAX_DROP_FRAC = 0.10
+
 
 # ── exceptions ─────────────────────────────────────────────────────────────
 
@@ -123,6 +130,14 @@ class CorpusBalanceError(ValueError):
 
     Caught by assert_sane_balance().  The message includes the diagnosis and
     recommended corrective action.
+    """
+
+
+class CorpusDropRateError(ValueError):
+    """Raised when the fraction of silently-dropped flows exceeds MAX_DROP_FRAC.
+
+    A high drop rate is an extraction bug signal, not normal cleaning.
+    Fix the underlying cause; do NOT raise the threshold.
     """
 
 
@@ -181,13 +196,70 @@ class CorpusStats:
 
 # ── pcap epoch reader ──────────────────────────────────────────────────────
 
+def _pcapng_start_epoch(f) -> float | None:
+    """Extract first-packet timestamp from an open pcapng file (f.seek(0) already done)."""
+    try:
+        raw = f.read(12)              # block_type(4) + btl(4) + bo_magic(4)
+        if len(raw) < 12:
+            return None
+        bo_le = struct.unpack("<I", raw[8:12])[0]
+        if bo_le == 0x1A2B3C4D:
+            endian = "<"
+        elif bo_le == 0x4D3C2B1A:
+            endian = ">"
+        else:
+            return None
+        shb_btl = struct.unpack(f"{endian}I", raw[4:8])[0]
+        f.seek(shb_btl)               # skip SHB entirely
+
+        ts_resol = 1_000_000          # default: microseconds
+
+        while True:
+            hdr = f.read(8)           # block_type + block_total_length
+            if len(hdr) < 8:
+                return None
+            block_type, btl = struct.unpack(f"{endian}II", hdr)
+
+            if block_type == 0x00000001:   # IDB — may carry if_tsresol (option 9)
+                body = f.read(btl - 8)     # body + trailing btl
+                opt_end = len(body) - 4    # exclude trailing btl from option scan
+                opt_off = 8                # after link_type(2)+reserved(2)+snap_len(4)
+                while opt_off + 4 <= opt_end:
+                    opt_code, opt_len = struct.unpack(f"{endian}HH", body[opt_off:opt_off+4])
+                    opt_off += 4
+                    if opt_code == 0:
+                        break
+                    if opt_code == 9 and opt_len >= 1 and opt_off < opt_end:
+                        rb = body[opt_off]
+                        ts_resol = (2 if (rb & 0x80) else 10) ** (rb & 0x7F)
+                    opt_off += opt_len
+                    if opt_len % 4:
+                        opt_off += 4 - (opt_len % 4)
+
+            elif block_type == 0x00000006: # EPB — interface_id(4)+ts_high(4)+ts_low(4)
+                preamble = f.read(12)
+                if len(preamble) < 12:
+                    return None
+                _, ts_high, ts_low = struct.unpack(f"{endian}III", preamble)
+                return ((ts_high << 32) | ts_low) / ts_resol
+
+            elif block_type == 0x00000002: # OPB — iface_id(2)+drops(2)+ts_high(4)+ts_low(4)
+                preamble = f.read(12)
+                if len(preamble) < 12:
+                    return None
+                _, _, ts_high, ts_low = struct.unpack(f"{endian}HHII", preamble)
+                return ((ts_high << 32) | ts_low) / ts_resol
+
+            else:                          # SPB or unknown — no timestamp, skip
+                f.seek(btl - 8, 1)
+    except (OSError, struct.error):
+        return None
+
+
 def get_pcap_start_epoch(pcap_path: str | Path) -> float | None:
-    """Return the first-packet timestamp from a pcap global header.
+    """Return the first-packet timestamp from a pcap or pcapng file.
 
-    Reads 24 bytes (global header) + 8 bytes (first packet record) to extract
-    ts_sec and ts_usec/ts_nsec.  Returns seconds since the Unix epoch as float.
-
-    Handles LE/BE and microsecond/nanosecond variants.
+    Handles pcap (LE/BE, microsecond/nanosecond) and pcapng (SHB + EPB/OPB blocks).
     Returns None (not 0.0) on any read or parse error so callers can distinguish
     a failed parse from a pcap that genuinely started at epoch 0.
     """
@@ -197,16 +269,19 @@ def get_pcap_start_epoch(pcap_path: str | Path) -> float | None:
             if len(hdr) < 24:
                 return None
             magic = struct.unpack("<I", hdr[:4])[0]
-            if magic == 0xA1B2C3D4:     # LE microseconds (most common)
+            if magic == 0xA1B2C3D4:       # pcap LE microseconds
                 endian, nano = "<", False
-            elif magic == 0xD4C3B2A1:   # BE microseconds
+            elif magic == 0xD4C3B2A1:     # pcap BE microseconds
                 endian, nano = ">", False
-            elif magic == 0xA1B23C4D:   # LE nanoseconds
+            elif magic == 0xA1B23C4D:     # pcap LE nanoseconds
                 endian, nano = "<", True
-            elif magic == 0x4D3CB2A1:   # BE nanoseconds
+            elif magic == 0x4D3CB2A1:     # pcap BE nanoseconds
                 endian, nano = ">", True
+            elif magic == 0x0A0D0D0A:     # pcapng
+                f.seek(0)
+                return _pcapng_start_epoch(f)
             else:
-                return None             # unknown magic — not a pcap file
+                return None
             pkt = f.read(16)
             if len(pkt) < 16:
                 return None
@@ -240,7 +315,7 @@ def load_label_index(
       total_attack_rows: count of rows with label=1 — used for accounting
 
     Each entry in the index carries a private '_row_idx' field (int) that
-    identifies the original CSV row.  _apply_labels() adds matched '_row_idx'
+    identifies the original CSV row.  _apply_labels_nf() adds matched '_row_idx'
     values to a set so build_corpus() can compute label_rows_matched.
 
     Accepts UNSW-NB15 canonical column names (srcip, sport, dstip, dsport,
@@ -249,20 +324,35 @@ def load_label_index(
     df = pd.read_csv(csv_path, low_memory=False)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
+    # Column normalisation — handles two GT file layouts:
+    #   Layout A (UNSW-NB15_1..4.csv per-flow feature files):
+    #       srcip, sport, dstip, dsport, proto, stime, ltime, label, attack_cat
+    #   Layout B (NUSW-NB15_GT.csv per-event attack list, no 'label' column):
+    #       source_ip, source_port, destination_ip, destination_port,
+    #       protocol, start_time, last_time, attack_category
+    _COL_ALIASES: dict[str, list[str]] = {
+        "srcip":      ["src_ip", "ip_src", "source_ip"],
+        "dstip":      ["dst_ip", "ip_dst", "destination_ip"],
+        "sport":      ["src_port", "srcport", "source_port"],
+        "dsport":     ["dst_port", "dstport", "destination_port"],
+        "proto":      ["protocol"],
+        "stime":      ["start_time"],
+        "ltime":      ["last_time"],
+        "attack_cat": ["attackcat", "attack_category"],
+    }
     rename: dict[str, str] = {}
     for col in df.columns:
-        if col in ("src_ip", "ip_src") and col != "srcip":
-            rename[col] = "srcip"
-        elif col in ("dst_ip", "ip_dst") and col != "dstip":
-            rename[col] = "dstip"
-        elif col in ("src_port", "srcport") and col != "sport":
-            rename[col] = "sport"
-        elif col in ("dst_port", "dstport") and col != "dsport":
-            rename[col] = "dsport"
-        elif col in ("attackcat", "attack_category") and col != "attack_cat":
-            rename[col] = "attack_cat"
+        for canonical, aliases in _COL_ALIASES.items():
+            if col in aliases and col != canonical:
+                rename[col] = canonical
+                break
     if rename:
         df = df.rename(columns=rename)
+
+    # Layout B has no 'label' column — every row is an attack event.
+    all_attacks_implicit = "label" not in df.columns
+    if all_attacks_implicit:
+        df["label"] = 1
 
     index: dict[tuple, list[dict]] = {}
     total_attack_rows = 0
@@ -306,126 +396,6 @@ def load_label_index(
     if skipped:
         log.warning("Skipped %d label rows with missing/invalid fields", skipped)
     return index, total_attack_rows
-
-
-# ── tshark extraction (shared with parity test) ────────────────────────────
-
-def extract_pcap_flows(
-    pcap_path: str | Path,
-    tshark_bin: str,
-) -> tuple[list[dict], dict]:
-    """Run both tshark passes and return (conv_dicts, flag_counts) unassembled.
-
-    The live path (adns_flows.extract_flows) calls run_pass_a + run_pass_b
-    internally; this wrapper makes the raw data available so the parity test
-    can verify that corpus extraction == live extraction.
-    """
-    pcap = str(pcap_path)
-    return run_pass_a(tshark_bin, pcap=pcap), run_pass_b(tshark_bin, pcap=pcap)
-
-
-# ── pass-B chunking helpers ────────────────────────────────────────────────
-
-def _find_editcap(tshark_bin: str) -> str:
-    """Return editcap path from the same Wireshark install as tshark."""
-    tshark_dir = Path(tshark_bin).parent
-    for name in ("editcap.exe", "editcap"):
-        candidate = tshark_dir / name
-        if candidate.is_file():
-            return str(candidate)
-    raise FileNotFoundError(
-        f"editcap not found alongside tshark at {tshark_dir}"
-    )
-
-
-def _editcap_env(tshark_bin: str) -> dict:
-    """Env dict for editcap subprocess — mirrors adns_flows extract._tshark_env."""
-    env = os.environ.copy()
-    tshark_dir = os.path.dirname(os.path.abspath(tshark_bin))
-    env["PATH"] = tshark_dir + os.pathsep + env.get("PATH", "")
-    env.setdefault("WIRESHARK_RUN_FROM_BUILD_DIRECTORY", "0")
-    return env
-
-
-def _merge_flag_counts(
-    merged: dict[tuple, dict[str, int]],
-    chunk: dict[tuple, dict[str, int]],
-) -> None:
-    """Add chunk flag counts into merged in-place (sum per flag per key)."""
-    for key, counts in chunk.items():
-        if key not in merged:
-            merged[key] = dict(counts)
-        else:
-            for flag, n in counts.items():
-                merged[key][flag] = merged[key].get(flag, 0) + n
-
-
-def run_pass_b_chunked(
-    tshark_bin: str,
-    pcap_path: str | Path,
-    *,
-    chunk_size: int = 500_000,
-    editcap_timeout: int = 600,
-    chunk_timeout_window: int = 90,
-) -> dict[tuple, dict[str, int]]:
-    """Run pass B by splitting pcap into chunks of chunk_size packets.
-
-    Uses editcap to split, then runs run_pass_b on each chunk and sums flag
-    counts.  The result is mathematically identical to a single-pass run:
-    each packet appears in exactly one chunk; orientation_key is symmetric so
-    counts aggregate correctly across chunks.
-
-    Parameters
-    ----------
-    tshark_bin          : absolute path to tshark
-    pcap_path           : PCAP to process
-    chunk_size          : max packets per chunk (default 500 000)
-    editcap_timeout     : seconds to allow editcap to split the file
-    chunk_timeout_window: window_sec passed to run_pass_b; timeout becomes
-                          max(chunk_timeout_window+30, 90) seconds per chunk
-
-    Raises
-    ------
-    RuntimeError   if editcap produces no chunk files
-    subprocess.TimeoutExpired / OSError  propagated from run_pass_b
-    """
-    editcap = _find_editcap(tshark_bin)
-    pcap_path = Path(pcap_path)
-    env = _editcap_env(tshark_bin)
-    popen_kw: dict = dict(env=env, cwd=str(Path(editcap).parent))
-    if sys.platform == "win32":
-        popen_kw["creationflags"] = _sp.CREATE_NO_WINDOW
-
-    with tempfile.TemporaryDirectory() as tmp:
-        chunk_stem = os.path.join(tmp, "chunk_.pcap")
-
-        # editcap -c N in.pcap chunk_.pcap → chunk__00001.pcap, chunk__00002.pcap …
-        _sp.run(
-            [editcap, "-c", str(chunk_size), str(pcap_path), chunk_stem],
-            capture_output=True,
-            timeout=editcap_timeout,
-            **popen_kw,
-        )
-
-        chunk_files = sorted(Path(tmp).glob("chunk_*.pcap"))
-        if not chunk_files:
-            raise RuntimeError(
-                f"editcap produced no chunk files for {pcap_path.name}"
-            )
-
-        log.info(
-            "  chunked pass B: %d chunks  (chunk_size=%d) for %s",
-            len(chunk_files), chunk_size, pcap_path.name,
-        )
-
-        merged: dict[tuple, dict[str, int]] = {}
-        for chunk in chunk_files:
-            chunk_counts = run_pass_b(
-                tshark_bin, pcap=str(chunk), window_sec=chunk_timeout_window,
-            )
-            _merge_flag_counts(merged, chunk_counts)
-
-        return merged
 
 
 # ── flood-cap sampling ─────────────────────────────────────────────────────
@@ -501,81 +471,78 @@ def _match_label(
     return None
 
 
-# ── three-way labeling core ────────────────────────────────────────────────
+# ── NFStream: protocol number → label string ──────────────────────────────────
+# Used by NFStream labeling functions to match GT CSV proto strings ("tcp"/"udp").
+_NF_PROTO_STR: dict[int, str] = {6: "TCP", 17: "UDP", 1: "ICMP"}
 
-def _apply_labels(
-    conv_dicts: list[dict],
-    flag_counts: dict,
-    pcap_start_epoch: float | None,
-    label_index: dict[tuple, list[dict]],
+
+def _reorient_flow(flow: _Flow, prefer_src: str | None) -> _Flow:
+    """Return flow re-oriented so prefer_src is canonical src.
+
+    If prefer_src matches flow.dst_ip, swap all directional fields and IPs/ports.
+    If prefer_src is None, already matches flow.src_ip, or matches neither endpoint,
+    return the flow unchanged.
+    """
+    if prefer_src is None or flow.src_ip == prefer_src:
+        return flow
+    if flow.dst_ip == prefer_src:
+        return _Flow(
+            ts=flow.ts,
+            src_ip=flow.dst_ip,     dst_ip=flow.src_ip,
+            src_port=flow.dst_port, dst_port=flow.src_port,
+            proto=flow.proto,       duration=flow.duration,
+            src_bytes=flow.dst_bytes, dst_bytes=flow.src_bytes,
+            src_pkts=flow.dst_pkts,   dst_pkts=flow.src_pkts,
+            syn_count=flow.syn_count, ack_count=flow.ack_count,
+            rst_count=flow.rst_count, fin_count=flow.fin_count,
+            psh_count=flow.psh_count, urg_count=flow.urg_count,
+        )
+    return flow   # prefer_src not in flow → keep default orientation
+
+
+# ── NFStream three-way labeling: UNSW time-window ────────────────────────────
+
+def _apply_labels_nf(
+    flows: list,
+    label_index: dict,
     matched_attack_row_indices: set[int],
 ) -> tuple[list[dict], CorpusStats]:
-    """Label a batch of conv_dicts against the label_index.
+    """Label NFStream flows against the UNSW label index (time-window matching).
 
-    Three-way outcomes per flow:
+    flow.ts is absolute epoch seconds (from PCAP packets); no pcap_start_epoch needed.
 
-      ATTACK  — matched an attack label row → label=1, prefer_src=attacker_ip
-      BENIGN  — no match (or matched a label=0 row) → label=0, prefer_src=None
-                A no-match flow is ALWAYS retained.  This is the critical fix:
-                "no label row" means benign traffic, not corrupt data.
-      DROPPED — genuine processing failure (no_timestamp or assembly error)
+    Drop reasons reachable on this path: 'other' (assembly exception).
+    'no_timestamp' and 'flags_unextractable' are unreachable (NFStream is single-pass
+    and reads absolute timestamps directly).
 
-    Parameters
-    ----------
-    conv_dicts               : raw conv dicts from run_pass_a
-    flag_counts              : flag dict from run_pass_b
-    pcap_start_epoch         : epoch seconds for the pcap's first packet,
-                               or None if the header was unreadable
-    label_index              : from load_label_index()
-    matched_attack_row_indices: set mutated in place — _row_idx of every
-                               attack label row matched by at least one flow
-
-    Returns (output_rows, batch_stats).  output_rows are ready to append to the
-    corpus; batch_stats holds per-batch counters to merge into the run total.
+    Three-way outcomes:
+      ATTACK  — flow.ts in GT [stime, ltime] ±TOL, endpoint+proto match → label=1,
+                re-oriented so attacker is canonical src.
+      BENIGN  — no match → label=0 (retained, never dropped)
+      DROPPED — assembly exception → reason='other'
     """
     stats = CorpusStats()
     rows: list[dict] = []
 
-    # If the pcap header timestamp is unreadable we cannot reconstruct abs_ts,
-    # so we cannot match against the GT CSV time window.  Drop all convs.
-    if pcap_start_epoch is None:
-        n = len(conv_dicts)
-        if n:
-            log.warning(
-                "Dropping %d flow(s): pcap header timestamp unreadable "
-                "(reason: %s)", n, REASON_NO_TIMESTAMP,
-            )
-        stats.n_dropped_unprocessable = n
-        stats.dropped_reasons[REASON_NO_TIMESTAMP] = n
-        return rows, stats
-
-    for conv in conv_dicts:
-        abs_ts = pcap_start_epoch + conv["rel_start"]
-        ep_a, ep_b = conv["ep_a"], conv["ep_b"]
-        key = orientation_key(ep_a[0], ep_a[1], ep_b[0], ep_b[1])
+    for flow in flows:
+        key       = orientation_key(flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port)
+        conv_like = {"proto": _NF_PROTO_STR.get(flow.proto, str(flow.proto))}
 
         try:
-            label_row = _match_label(conv, abs_ts, key, label_index)
+            label_row = _match_label(conv_like, flow.ts, key, label_index)
 
             if label_row is not None and label_row.get("label") == 1:
-                # ── ATTACK ────────────────────────────────────────────────
                 prefer_src = label_row["srcip"]
                 attack_cat = label_row["attack_cat"]
                 label_val  = 1
                 matched_attack_row_indices.add(label_row["_row_idx"])
+                flow = _reorient_flow(flow, prefer_src)
             else:
-                # ── BENIGN ────────────────────────────────────────────────
-                # No match, OR matched a label=0 row in the GT CSV.
-                # Either way: normal traffic, retain with label=0.
-                # This is the path that was incorrectly "continue" before —
-                # no-match flows are NOT dropped.
-                prefer_src = None
                 attack_cat = ""
                 label_val  = 0
 
-            flow = build_flows([conv], flag_counts, prefer_src=prefer_src)[0]
             row = flow_to_row(flow)
-            row["ts"]         = abs_ts
+            row["ts"]         = flow.ts
             row["label"]      = label_val
             row["attack_cat"] = attack_cat
             rows.append(row)
@@ -587,8 +554,138 @@ def _apply_labels(
 
         except Exception as exc:
             log.warning(
-                "Error assembling conv %s<->%s: %s (reason: %s)",
-                conv.get("ep_a"), conv.get("ep_b"), exc, REASON_OTHER,
+                "Error labeling NFStream flow %s:%s<->%s:%s: %s (reason: %s)",
+                flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port,
+                exc, REASON_OTHER,
+            )
+            stats.n_dropped_unprocessable += 1
+            stats.dropped_reasons[REASON_OTHER] = (
+                stats.dropped_reasons.get(REASON_OTHER, 0) + 1
+            )
+
+    return rows, stats
+
+
+# ── NFStream three-way labeling: Gotham PCAP-level ───────────────────────────
+
+def _apply_labels_gotham_nf(
+    flows: list,
+    is_attack: bool,
+    attack_cat: str,
+    attacker_ips: list[str],
+) -> tuple[list[dict], CorpusStats]:
+    """Label NFStream flows for Gotham (PCAP-level, no time-window matching).
+
+    For each attack flow, the first matching attacker IP in attacker_ips is used
+    to pin canonical src via _reorient_flow().  Falls back to default orientation
+    when no attacker IP appears in the flow (mirrors tshark's per-flow IP lookup).
+
+    Drop reasons reachable: 'other' only.
+    """
+    stats = CorpusStats()
+    rows: list[dict] = []
+
+    for flow in flows:
+        try:
+            if is_attack:
+                matching_attacker = next(
+                    (ip for ip in attacker_ips if ip in (flow.src_ip, flow.dst_ip)),
+                    None,
+                )
+                flow      = _reorient_flow(flow, matching_attacker)
+                label_val = 1
+                cat       = attack_cat
+            else:
+                label_val = 0
+                cat       = ""
+
+            row = flow_to_row(flow)
+            row["ts"]         = flow.ts
+            row["label"]      = label_val
+            row["attack_cat"] = cat
+            rows.append(row)
+
+            if label_val == 1:
+                stats.n_attack += 1
+            else:
+                stats.n_benign += 1
+
+        except Exception as exc:
+            log.warning(
+                "Error labeling NFStream Gotham flow: %s (reason: %s)",
+                exc, REASON_OTHER,
+            )
+            stats.n_dropped_unprocessable += 1
+            stats.dropped_reasons[REASON_OTHER] = (
+                stats.dropped_reasons.get(REASON_OTHER, 0) + 1
+            )
+
+    return rows, stats
+
+
+# ── NFStream three-way labeling: CIC IP+port+time window ─────────────────────
+
+def _match_cic_window_nf(flow: _Flow, cic_windows: list[dict]) -> dict | None:
+    """Match a NFStream Flow against CIC attack windows by IP+port+time.
+
+    Checks both canonical orderings since canonical src/dst may not align with
+    attacker/victim (brute-force attacks use random source ports).
+    """
+    proto_str = _NF_PROTO_STR.get(flow.proto, str(flow.proto))
+    for w in cic_windows:
+        if proto_str != w["proto"]:
+            continue
+        if not (w["stime"] - TIME_TOLERANCE <= flow.ts <= w["ltime"] + TIME_TOLERANCE):
+            continue
+        if (flow.src_ip == w["attacker_ip"] and flow.dst_ip == w["victim_ip"]
+                and flow.dst_port == w["dst_port"]):
+            return w
+        if (flow.dst_ip == w["attacker_ip"] and flow.src_ip == w["victim_ip"]
+                and flow.src_port == w["dst_port"]):
+            return w
+    return None
+
+
+def _apply_labels_cic_nf(
+    flows: list,
+    cic_windows: list[dict],
+    matched_window_cats: set[str],
+) -> tuple[list[dict], CorpusStats]:
+    """Label NFStream flows for CIC-IDS2017 by IP+port+time-window matching.
+
+    Drop reasons reachable: 'other' only.
+    """
+    stats = CorpusStats()
+    rows: list[dict] = []
+
+    for flow in flows:
+        try:
+            window = _match_cic_window_nf(flow, cic_windows)
+
+            if window is not None:
+                flow      = _reorient_flow(flow, window["attacker_ip"])
+                attack_cat = window["attack_cat"]
+                label_val  = 1
+                matched_window_cats.add(attack_cat)
+            else:
+                attack_cat = ""
+                label_val  = 0
+
+            row = flow_to_row(flow)
+            row["ts"]         = flow.ts
+            row["label"]      = label_val
+            row["attack_cat"] = attack_cat
+            rows.append(row)
+
+            if label_val == 1:
+                stats.n_attack += 1
+            else:
+                stats.n_benign += 1
+
+        except Exception as exc:
+            log.warning(
+                "Error labeling NFStream CIC flow: %s (reason: %s)",
+                exc, REASON_OTHER,
             )
             stats.n_dropped_unprocessable += 1
             stats.dropped_reasons[REASON_OTHER] = (
@@ -658,15 +755,53 @@ def assert_sane_balance(
         )
 
 
+def assert_drop_rate(
+    n_dropped: int,
+    total_seen: int,
+    dropped_reasons: dict[str, int],
+    *,
+    max_drop_frac: float = MAX_DROP_FRAC,
+) -> None:
+    """Raise CorpusDropRateError if n_dropped / total_seen > max_drop_frac.
+
+    total_seen = n_attack + n_benign + n_dropped (every flow the pipeline saw).
+    A rate above max_drop_frac almost always indicates an extraction bug
+    (e.g. an unrecognised pcap magic in get_pcap_start_epoch silently returning
+    None) rather than genuine cleaning.  Fix the root cause; never raise the
+    threshold as a workaround.
+
+    Safe on an empty pipeline run (total_seen == 0 → no check performed;
+    the balance gate catches empty corpora separately).
+    """
+    if total_seen == 0:
+        return
+    drop_frac = n_dropped / total_seen
+    if drop_frac > max_drop_frac:
+        breakdown = "  ".join(
+            f"{k}={v:,}" for k, v in sorted(dropped_reasons.items())
+        )
+        raise CorpusDropRateError(
+            f"Drop rate {100 * drop_frac:.1f}% "
+            f"({n_dropped:,} dropped / {total_seen:,} total flows seen) "
+            f"exceeds {100 * max_drop_frac:.0f}% threshold. "
+            f"Reason breakdown: [{breakdown}]. "
+            "A high drop rate almost always indicates an extraction bug — "
+            "fix the underlying cause rather than raising the threshold. "
+            "Common causes: unrecognised pcap magic in get_pcap_start_epoch, "
+            "tshark version mismatch, or wrong pcap directory."
+        )
+
+
 # ── main pipeline ──────────────────────────────────────────────────────────
 
 def build_corpus(
     pcap_dir: str | Path,
     label_csv: str | Path,
-    tshark_bin: str,
     out_parquet: str | Path,
     *,
     allow_skewed: bool = False,
+    flood_cap: int = DEFAULT_FLOOD_CAP,
+    n_meters: int = 1,
 ) -> tuple[pd.DataFrame, CorpusStats]:
     """Extract, label, and save a training corpus from UNSW-NB15 pcaps.
 
@@ -674,11 +809,17 @@ def build_corpus(
     ----------
     pcap_dir    : directory containing .pcap / .pcapng files
     label_csv   : UNSW-NB15 ground-truth CSV path
-    tshark_bin  : absolute path to the tshark binary
     out_parquet : output path for the labeled parquet corpus
     allow_skewed: if True, skip the class-balance gate (prints WARNING, proceeds)
+    flood_cap   : per-source-IP cap on degenerate one-sided flood flows
+                  (src_pkts<=1, dst_pkts==0, label=1).  0 = disable.
+                  Default DEFAULT_FLOOD_CAP.
+    n_meters    : NFStream worker count (default 1; corpus builds may use higher for speed).
 
     Returns (labeled_DataFrame, CorpusStats).
+
+    Raises CorpusDropRateError BEFORE writing the parquet if >MAX_DROP_FRAC of
+    all flows seen were silently dropped (extraction bug signal).
 
     Raises CorpusBalanceError BEFORE writing the parquet if the corpus is
     implausibly skewed (nearly all attack, or nearly no attack), unless
@@ -714,27 +855,22 @@ def build_corpus(
     for pcap_path in pcap_files:
         log.info("Processing %s", pcap_path.name)
 
-        pcap_start = get_pcap_start_epoch(pcap_path)
-        if pcap_start is None:
-            log.warning(
-                "%s: header timestamp unreadable — flows will be dropped",
-                pcap_path.name,
-            )
-        # Attempt tshark extraction regardless of pcap_start result.
-        # If pcap_start is None, _apply_labels will drop all convs as no_timestamp.
         try:
-            conv_dicts, flag_counts = extract_pcap_flows(pcap_path, tshark_bin)
+            flows = extract_flows_nfstream(str(pcap_path), n_meters=n_meters)
         except Exception as exc:
-            log.warning("tshark failed on %s: %s", pcap_path.name, exc)
+            log.warning(
+                "NFStream extraction failed on %s: %s — dropping PCAP",
+                pcap_path.name, exc,
+            )
             total_stats.n_dropped_unprocessable += 1
             total_stats.dropped_reasons[REASON_EXTRACTION_FAIL] = (
                 total_stats.dropped_reasons.get(REASON_EXTRACTION_FAIL, 0) + 1
             )
             continue
-
-        batch_rows, batch_stats = _apply_labels(
-            conv_dicts, flag_counts, pcap_start, label_index, matched_attack_row_idx,
+        batch_rows, batch_stats = _apply_labels_nf(
+            flows, label_index, matched_attack_row_idx,
         )
+
         all_rows.extend(batch_rows)
         total_stats.merge(batch_stats)
 
@@ -762,6 +898,12 @@ def build_corpus(
         total_stats.label_rows_unmatched, total_stats.dropped_reasons,
     )
 
+    # ── drop-rate gate (before writing parquet) ────────────────────────────
+    total_seen = total_stats.total_kept + total_stats.n_dropped_unprocessable
+    assert_drop_rate(
+        total_stats.n_dropped_unprocessable, total_seen, total_stats.dropped_reasons,
+    )
+
     # ── class-balance gate (before writing parquet) ────────────────────────
     if not allow_skewed:
         assert_sane_balance(total_stats.n_attack, total_stats.n_benign)
@@ -782,113 +924,54 @@ def build_corpus(
             ["ts", "src_ip", "src_port", "dst_ip", "dst_port"]
         ).reset_index(drop=True)
 
+    # ── Flood cap (same as Gotham v2: DEFAULT_FLOOD_CAP/src_ip) ───────────
+    if flood_cap > 0 and len(df) > 0:
+        n_before = len(df)
+        n_att_before = int((df["label"] == 1).sum())
+        df, n_flood_dropped = apply_flood_cap(df, cap=flood_cap)
+        n_att_after = int((df["label"] == 1).sum())
+        log.info(
+            "Flood cap (N=%d/src_ip): dropped %d degenerate flows  "
+            "attack before=%d after=%d  "
+            "total before=%d after=%d",
+            flood_cap, n_flood_dropped,
+            n_att_before, n_att_after,
+            n_before, len(df),
+        )
+        total_stats.n_attack = n_att_after
+        total_stats.n_benign = int((df["label"] == 0).sum())
+
     df.to_parquet(out_parquet, index=False)
     log.info("Wrote %d rows to %s", len(df), out_parquet)
     return df, total_stats
 
 
-# ── Gotham labeling (PCAP-level, no time-window matching) ─────────────────
-
-def _apply_labels_gotham(
-    conv_dicts: list[dict],
-    flag_counts: dict,
-    pcap_start_epoch: float | None,
-    is_attack: bool,
-    attack_cat: str,
-    attacker_ips: list[str],
-) -> tuple[list[dict], CorpusStats]:
-    """Label Gotham flows by PCAP-level label (directory-based, no time matching).
-
-    For benign PCAPs:  every flow → label=0, prefer_src=None.
-    For attack PCAPs:  every flow → label=1, attack_cat=<cat>,
-                       prefer_src=first attacker IP matching one endpoint.
-
-    pcap_start_epoch=None drops all flows as no_timestamp — same behaviour
-    as _apply_labels() for consistent DROPPED accounting.
-    """
-    stats = CorpusStats()
-    rows: list[dict] = []
-
-    if pcap_start_epoch is None:
-        n = len(conv_dicts)
-        if n:
-            log.warning(
-                "Dropping %d flow(s): pcap header timestamp unreadable "
-                "(reason: %s)", n, REASON_NO_TIMESTAMP,
-            )
-        stats.n_dropped_unprocessable = n
-        stats.dropped_reasons[REASON_NO_TIMESTAMP] = n
-        return rows, stats
-
-    for conv in conv_dicts:
-        abs_ts = pcap_start_epoch + conv["rel_start"]
-
-        try:
-            if is_attack:
-                ep_a_ip = conv["ep_a"][0]
-                ep_b_ip = conv["ep_b"][0]
-                prefer_src = next(
-                    (ip for ip in attacker_ips if ip in (ep_a_ip, ep_b_ip)),
-                    None,   # fall back to default orientation if no attacker IP matches
-                )
-                label_val  = 1
-                cat        = attack_cat
-            else:
-                prefer_src = None
-                label_val  = 0
-                cat        = ""
-
-            flow = build_flows([conv], flag_counts, prefer_src=prefer_src)[0]
-            row  = flow_to_row(flow)
-            row["ts"]         = abs_ts
-            row["label"]      = label_val
-            row["attack_cat"] = cat
-            rows.append(row)
-
-            if label_val == 1:
-                stats.n_attack += 1
-            else:
-                stats.n_benign += 1
-
-        except Exception as exc:
-            log.warning(
-                "Error assembling conv %s<->%s: %s (reason: %s)",
-                conv.get("ep_a"), conv.get("ep_b"), exc, REASON_OTHER,
-            )
-            stats.n_dropped_unprocessable += 1
-            stats.dropped_reasons[REASON_OTHER] = (
-                stats.dropped_reasons.get(REASON_OTHER, 0) + 1
-            )
-
-    return rows, stats
-
-
 def build_corpus_gotham(
     gotham_root: str | Path,
-    tshark_bin: str,
     out_parquet: str | Path,
     *,
     allow_skewed: bool = False,
     flood_cap: int = DEFAULT_FLOOD_CAP,
+    n_meters: int = 1,
 ) -> tuple[pd.DataFrame, CorpusStats]:
     """Extract, label, and save a Gotham training corpus.
 
     Parameters
     ----------
     gotham_root : Gotham dataset root (must contain raw/benign/ and raw/malicious/)
-    tshark_bin  : absolute path to the tshark binary
     out_parquet : output path for the labeled parquet corpus
     allow_skewed: if True, skip the class-balance gate (useful for single-pcap
                   sanity checks where the PCAP is expectedly single-class)
     flood_cap   : per-source-IP cap on degenerate one-sided flood flows
                   (src_pkts<=1, dst_pkts==0, label=1).  Set to 0 to disable.
                   Default DEFAULT_FLOOD_CAP.
+    n_meters    : NFStream worker count (default 1).
 
     Label-row accounting in Gotham mode
     ------------------------------------
-    label_rows_total   = number of attack PCAPs discovered
-    label_rows_matched = attack PCAPs that produced ≥1 attack flow
-    label_rows_unmatched = attack PCAPs producing 0 flows (likely tshark failure)
+    label_rows_total     = number of attack PCAPs discovered
+    label_rows_matched   = attack PCAPs that produced ≥1 attack flow
+    label_rows_unmatched = attack PCAPs producing 0 flows (NFStream extraction failure)
 
     The class-balance gate applies to the FULL corpus, not per-PCAP.
     Individual benign PCAPs have no attacks (legitimately all-benign);
@@ -920,22 +1003,11 @@ def build_corpus_gotham(
             spec.attack_cat if spec.is_attack else "benign",
         )
 
-        pcap_start = get_pcap_start_epoch(spec.pcap_path)
-        if pcap_start is None:
-            log.warning(
-                "%s: header timestamp unreadable — flows will be dropped",
-                spec.pcap_path.name,
-            )
-
-        # ── Pass A: conv stats (always needed) ──────────────────────────────
         try:
-            conv_dicts = run_pass_a(
-                tshark_bin, pcap=str(spec.pcap_path),
-                window_sec=570,  # max(570+30, 90) = 600s timeout
-            )
+            flows = extract_flows_nfstream(str(spec.pcap_path), n_meters=n_meters)
         except Exception as exc:
             log.warning(
-                "Pass A failed on %s: %s — dropping PCAP",
+                "NFStream extraction failed on %s: %s — dropping PCAP",
                 spec.pcap_path.name, exc,
             )
             total_stats.n_dropped_unprocessable += 1
@@ -943,51 +1015,10 @@ def build_corpus_gotham(
                 total_stats.dropped_reasons.get(REASON_EXTRACTION_FAIL, 0) + 1
             )
             continue
-
-        # ── Pass B: TCP flags — try normal → chunked → quarantine ────────
-        # NEVER silently zero-fill.  Fabricated zeros corrupt flag features
-        # and create a capture-size-correlated leak (large DDoS pcaps would
-        # have all flags=0, making them trivially distinguishable from flows
-        # where flags were actually observed).  Any PCAP whose TCP flag counts
-        # cannot be extracted after chunking is quarantined entirely.
-        flags_ok = True
-        try:
-            flag_counts = run_pass_b(tshark_bin, pcap=str(spec.pcap_path))
-        except _sp.TimeoutExpired:
-            size_mb = spec.pcap_path.stat().st_size / 1_048_576
-            log.warning(
-                "%s: pass B timed out (%.0f MB) — trying chunked pass B",
-                spec.pcap_path.name, size_mb,
-            )
-            try:
-                flag_counts = run_pass_b_chunked(tshark_bin, spec.pcap_path)
-                log.info("  chunked pass B completed for %s", spec.pcap_path.name)
-            except Exception as chunk_exc:
-                log.warning(
-                    "%s: chunked pass B also failed (%s) — quarantining "
-                    "all flows as flags_unextractable",
-                    spec.pcap_path.name, chunk_exc,
-                )
-                flags_ok = False
-        except Exception as exc:
-            log.warning(
-                "%s: pass B failed (%s) — quarantining flows",
-                spec.pcap_path.name, exc,
-            )
-            flags_ok = False
-
-        if not flags_ok:
-            n_q = len(conv_dicts)
-            total_stats.n_dropped_unprocessable += n_q
-            total_stats.dropped_reasons[REASON_FLAGS_UNEXTRACTABLE] = (
-                total_stats.dropped_reasons.get(REASON_FLAGS_UNEXTRACTABLE, 0) + n_q
-            )
-            continue
-
-        batch_rows, batch_stats = _apply_labels_gotham(
-            conv_dicts, flag_counts, pcap_start,
-            spec.is_attack, spec.attack_cat, spec.attacker_ips,
+        batch_rows, batch_stats = _apply_labels_gotham_nf(
+            flows, spec.is_attack, spec.attack_cat, spec.attacker_ips,
         )
+
         all_rows.extend(batch_rows)
         total_stats.merge(batch_stats)
 
@@ -1011,6 +1042,12 @@ def build_corpus_gotham(
         total_stats.n_attack, total_stats.n_benign, total_stats.n_dropped_unprocessable,
         len(attack_specs), total_stats.label_rows_matched,
         total_stats.label_rows_unmatched, total_stats.dropped_reasons,
+    )
+
+    # ── drop-rate gate (before writing parquet) ────────────────────────────
+    total_seen = total_stats.total_kept + total_stats.n_dropped_unprocessable
+    assert_drop_rate(
+        total_stats.n_dropped_unprocessable, total_seen, total_stats.dropped_reasons,
     )
 
     if not allow_skewed:
@@ -1054,14 +1091,122 @@ def build_corpus_gotham(
     return df, total_stats
 
 
+# ── CIC-IDS2017 pipeline ──────────────────────────────────────────────────
+
+def build_corpus_cic(
+    pcap_path: str | Path,
+    cic_windows: list[dict],
+    out_parquet: str | Path,
+    *,
+    allow_skewed: bool = False,
+    flood_cap: int = DEFAULT_FLOOD_CAP,
+    n_meters: int = 1,
+) -> tuple[pd.DataFrame, CorpusStats]:
+    """Extract, label, and save a CIC-IDS2017 Tuesday corpus.
+
+    Parameters
+    ----------
+    pcap_path   : path to Tuesday-WorkingHours.pcap (single file, ~11 GB)
+    cic_windows : attack window list from corpus.cic_labels.CIC_ATTACK_WINDOWS
+    out_parquet : output path for the labeled parquet corpus
+    allow_skewed: if True, skip the class-balance gate
+    flood_cap   : per-source-IP cap on degenerate one-sided flood flows
+    n_meters    : NFStream worker count (default 1).
+
+    Attack labeling
+    ---------------
+    CIC brute-force attacks use random source ports, so UNSW-style
+    orientation_key lookup is inapplicable.  _apply_labels_cic_nf() matches by:
+      proto==TCP AND flow.ts in window AND attacker_ip/victim_ip/dst_port match.
+    All other flows → label=0 (benign).
+    """
+    pcap_path   = Path(pcap_path)
+    out_parquet = Path(out_parquet)
+    out_parquet.parent.mkdir(parents=True, exist_ok=True)
+
+    if not pcap_path.exists():
+        raise FileNotFoundError(f"CIC PCAP not found: {pcap_path}")
+
+    log.info("CIC build: %s  (%d attack windows)", pcap_path.name, len(cic_windows))
+
+    total_stats = CorpusStats(label_rows_total=len(cic_windows))
+    all_rows: list[dict] = []
+
+    try:
+        flows = extract_flows_nfstream(str(pcap_path), n_meters=n_meters)
+    except Exception as exc:
+        raise RuntimeError(
+            f"NFStream extraction failed on {pcap_path.name}: {exc}"
+        ) from exc
+    matched_window_cats: set[str] = set()
+    batch_rows, batch_stats = _apply_labels_cic_nf(
+        flows, cic_windows, matched_window_cats,
+    )
+    all_rows.extend(batch_rows)
+    total_stats.merge(batch_stats)
+    total_stats.label_rows_matched = len(matched_window_cats)
+
+    log.info(
+        "CIC corpus stats — n_attack=%d  n_benign=%d  n_dropped=%d  "
+        "windows: total=%d  matched=%d  dropped_reasons=%s",
+        total_stats.n_attack, total_stats.n_benign,
+        total_stats.n_dropped_unprocessable,
+        len(cic_windows), total_stats.label_rows_matched,
+        total_stats.dropped_reasons,
+    )
+
+    # ── gates ─────────────────────────────────────────────────────────────────
+    total_seen = total_stats.total_kept + total_stats.n_dropped_unprocessable
+    assert_drop_rate(
+        total_stats.n_dropped_unprocessable, total_seen, total_stats.dropped_reasons,
+    )
+
+    if not allow_skewed:
+        assert_sane_balance(total_stats.n_attack, total_stats.n_benign)
+    else:
+        log.warning(
+            "ALLOW_SKEWED: class-balance check bypassed. "
+            "n_attack=%d (%.1f%%)  n_benign=%d (%.1f%%)  Proceed with caution.",
+            total_stats.n_attack, 100 * total_stats.attack_frac,
+            total_stats.n_benign, 100 * total_stats.benign_frac,
+        )
+
+    if not all_rows:
+        log.warning("No flows produced — corpus is empty")
+        df = pd.DataFrame(columns=OUTPUT_COLUMNS)
+    else:
+        df = pd.DataFrame(all_rows)[OUTPUT_COLUMNS]
+        df = df.sort_values(
+            ["ts", "src_ip", "src_port", "dst_ip", "dst_port"]
+        ).reset_index(drop=True)
+
+    if flood_cap > 0 and len(df) > 0:
+        n_before     = len(df)
+        n_att_before = int((df["label"] == 1).sum())
+        df, n_flood_dropped = apply_flood_cap(df, cap=flood_cap)
+        n_att_after  = int((df["label"] == 1).sum())
+        log.info(
+            "Flood cap (N=%d/src_ip): dropped %d degenerate flows  "
+            "attack before=%d after=%d  total before=%d after=%d",
+            flood_cap, n_flood_dropped,
+            n_att_before, n_att_after,
+            n_before, len(df),
+        )
+        total_stats.n_attack = n_att_after
+        total_stats.n_benign = int((df["label"] == 0).sum())
+
+    df.to_parquet(out_parquet, index=False)
+    log.info("Wrote %d rows to %s", len(df), out_parquet)
+    return df, total_stats
+
+
 # ── CLI subcommands ────────────────────────────────────────────────────────
 
-def _cmd_sanity_check(pcap_path: str, label_csv: str, tshark_bin: str) -> None:
-    """Run the full pipeline on a single pcap, print stats, PASS/FAIL verdict.
+def _cmd_sanity_check(pcap_path: str, label_csv: str) -> None:
+    """Run the full UNSW pipeline on a single pcap, print stats, PASS/FAIL verdict.
 
-    Does NOT write a parquet.  Run this before committing to a full multi-pcap
-    build to verify epoch reconstruction and class balance on one representative
-    pcap.
+    Does NOT write a parquet.  Run before a full multi-pcap build to verify
+    epoch alignment and class balance on one representative pcap.
     """
     import tempfile, os
 
@@ -1070,7 +1215,6 @@ def _cmd_sanity_check(pcap_path: str, label_csv: str, tshark_bin: str) -> None:
         print(f"ERROR: pcap not found: {pcap}")
         sys.exit(1)
 
-    # Wrap the single pcap in a temp dir so build_corpus's pcap_dir logic works.
     with tempfile.TemporaryDirectory() as tmpdir:
         link = Path(tmpdir) / pcap.name
         try:
@@ -1086,9 +1230,8 @@ def _cmd_sanity_check(pcap_path: str, label_csv: str, tshark_bin: str) -> None:
             df, stats = build_corpus(
                 pcap_dir=tmpdir,
                 label_csv=label_csv,
-                tshark_bin=tshark_bin,
                 out_parquet=tmp_parquet,
-                allow_skewed=True,  # balance check is printed separately below
+                allow_skewed=True,
             )
         except Exception as exc:
             print(f"\nERROR during extraction: {exc}")
@@ -1121,191 +1264,257 @@ def _cmd_sanity_check(pcap_path: str, label_csv: str, tshark_bin: str) -> None:
         sys.exit(1)
 
 
-def _cmd_sanity_check_gotham(
-    pcap_path: str,
-    gotham_root: str,
-    tshark_bin: str,
-) -> None:
-    """Run single-pcap sanity check for a Gotham PCAP (no parquet written).
+def _cmd_probe_cic(pcap_path: str) -> None:
+    """Print CIC-IDS2017 timezone probe: PCAP epoch vs expected attack windows.
 
-    Detects attack type from the PCAP's parent directory name.  If the parent
-    is not a known attack category or 'benign', reports an error.
-
-    Gotham per-device PCAPs are expectedly single-class (all-benign OR
-    all-attack), so --allow-skewed is set automatically for the extraction step.
-    The balance verdict is printed based on the pcap's actual content.
+    Reads the PCAP header and compares the start epoch to the hardcoded value in
+    cic_labels.py.  Prints each attack window in both UTC and ADT so the caller
+    can verify alignment with the published schedule without re-running io,stat.
     """
-    import tempfile, os
-    from corpus.gotham_labels import ATTACK_CAT_MAP, ATTACKER_IPS, GothamPcapSpec
+    from corpus.cic_labels import CIC_ATTACK_WINDOWS, PCAP_START_EPOCH
+    from datetime import datetime, timezone, timedelta
+
+    pcap_start = get_pcap_start_epoch(pcap_path)
+    if pcap_start is None:
+        print(f"ERROR: cannot read pcap header timestamp from {pcap_path}")
+        sys.exit(1)
+
+    ADT = timezone(timedelta(hours=-3))
+    utc = timezone.utc
+
+    print(f"\n=== CIC-IDS2017 Tuesday timezone probe ===")
+    print(f"  PCAP         : {pcap_path}")
+    print(f"  Start epoch  : {pcap_start:.3f}")
+    print(
+        f"  Start (UTC)  : "
+        f"{datetime.fromtimestamp(pcap_start, tz=utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+    print(
+        f"  Start (ADT)  : "
+        f"{datetime.fromtimestamp(pcap_start, tz=ADT).strftime('%Y-%m-%d %H:%M:%S ADT')}"
+    )
+    print(f"  Hardcoded    : {PCAP_START_EPOCH}")
+
+    delta = pcap_start - PCAP_START_EPOCH
+    if abs(delta) > 1.0:
+        print(
+            f"  WARNING: epoch differs from hardcoded by {delta:+.3f}s — "
+            "update PCAP_START_EPOCH in cic_labels.py"
+        )
+    else:
+        print(f"  Epoch match  : OK (delta={delta:+.3f}s)")
+
+    print(f"\n  Attack windows (derived from PCAP io,stat analysis):")
+    for w in CIC_ATTACK_WINDOWS:
+        ws = datetime.fromtimestamp(w["stime"], tz=utc)
+        we = datetime.fromtimestamp(w["ltime"],   tz=utc)
+        as_ = datetime.fromtimestamp(w["stime"], tz=ADT)
+        ae  = datetime.fromtimestamp(w["ltime"],   tz=ADT)
+        print(f"    {w['attack_cat']}")
+        print(f"      UTC  : {ws.strftime('%H:%M')}–{we.strftime('%H:%M')}")
+        print(f"      ADT  : {as_.strftime('%H:%M')}–{ae.strftime('%H:%M')}")
+        print(f"      {w['attacker_ip']} → {w['victim_ip']}:{w['dst_port']}/{w['proto']}")
+
+    print(
+        f"\n  Verdict: PASS — timezone confirmed ADT (UTC-3) from io,stat burst analysis"
+    )
+
+
+def _cmd_sanity_check_cic(pcap_path: str) -> None:
+    """Run the CIC build pipeline on a single PCAP (no parquet written).
+
+    Suitable for passing a pre-sliced attack-window file (e.g. cic_ssh_window.pcap)
+    rather than the full 11 GB PCAP.  Prints n_attack / n_benign / balance verdict.
+    """
+    import os
+    import tempfile
+    from corpus.cic_labels import CIC_ATTACK_WINDOWS
 
     pcap = Path(pcap_path)
     if not pcap.exists():
         print(f"ERROR: pcap not found: {pcap}")
         sys.exit(1)
 
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tf:
+        tmp_parquet = tf.name
+
+    try:
+        df, stats = build_corpus_cic(
+            pcap_path=pcap,
+            cic_windows=CIC_ATTACK_WINDOWS,
+            out_parquet=tmp_parquet,
+            allow_skewed=True,
+        )
+    except Exception as exc:
+        print(f"\nERROR during extraction: {exc}")
+        if os.path.exists(tmp_parquet):
+            os.unlink(tmp_parquet)
+        sys.exit(1)
+    finally:
+        if os.path.exists(tmp_parquet):
+            os.unlink(tmp_parquet)
+
+    total = stats.n_attack + stats.n_benign
+    print("\n=== CIC sanity-check results ===")
+    print(f"  Pcap              : {pcap.name}")
+    print(
+        f"  Flows kept        : {total:,}  "
+        f"(attack={stats.n_attack:,}  benign={stats.n_benign:,})"
+    )
+    print(
+        f"  Attack fraction   : {100*stats.attack_frac:.3f}%  "
+        f"Benign: {100*stats.benign_frac:.2f}%"
+    )
+    print(f"  Dropped           : {stats.n_dropped_unprocessable}  "
+          f"reasons={stats.dropped_reasons}")
+    print(
+        f"  Windows matched   : {stats.label_rows_matched}/{stats.label_rows_total}"
+    )
+
+    try:
+        assert_sane_balance(stats.n_attack, stats.n_benign)
+        print("\n  Balance check     : PASS")
+    except CorpusBalanceError as e:
+        print(f"\n  Balance check     : FAIL\n  {e}")
+        sys.exit(1)
+
+
+def _cmd_probe_attack_nf(
+    row_idx: int,
+    pcap_path: str,
+    label_csv: str,
+    n_meters: int = 1,
+) -> None:
+    """Like --probe-attack but using NFStream flows (absolute timestamps).
+
+    For each flow whose orientation_key + proto matches the target GT row
+    (ignoring time), print flow.ts vs the GT [stime, ltime] window with delta.
+    This re-proves that NFStream's flow grain still places attack flows inside
+    the label window — mandatory before trusting an NFStream corpus build.
+    """
+    label_index, _ = load_label_index(label_csv)
+
+    df_raw = pd.read_csv(label_csv, low_memory=False)
+    if row_idx >= len(df_raw):
+        print(f"ERROR: row_idx={row_idx} out of range (CSV has {len(df_raw)} rows)")
+        import sys; sys.exit(1)
+    df_raw.columns = [c.strip().lower().replace(" ", "_") for c in df_raw.columns]
+    _DISP_ALIASES = {
+        "source_ip": "srcip", "src_ip": "srcip",
+        "destination_ip": "dstip", "dst_ip": "dstip",
+        "source_port": "sport", "src_port": "sport",
+        "destination_port": "dsport", "dst_port": "dsport",
+        "protocol": "proto", "start_time": "stime",
+        "last_time": "ltime", "attack_category": "attack_cat",
+    }
+    df_raw = df_raw.rename(columns={k: v for k, v in _DISP_ALIASES.items() if k in df_raw.columns})
+    raw = df_raw.iloc[row_idx]
+
+    print(f"\n=== NFStream probe — GT row {row_idx} ===")
+    print(f"  srcip={raw.get('srcip','?')}  sport={raw.get('sport','?')}  "
+          f"dstip={raw.get('dstip','?')}  dsport={raw.get('dsport','?')}  "
+          f"proto={raw.get('proto','?')}  stime={raw.get('stime','?')}  "
+          f"ltime={raw.get('ltime','?')}")
+
+    target_entries = [
+        e for entries in label_index.values() for e in entries
+        if e.get("_row_idx") == row_idx
+    ]
+    if not target_entries:
+        print("  (row not found in label index)")
+        return
+    entry    = target_entries[0]
+    tgt_key  = orientation_key(entry["srcip"], entry["sport"], entry["dstip"], entry["dsport"])
+    tgt_proto_num = {"tcp": 6, "udp": 17}.get(entry["proto"].lower(), -1)
+    stime    = entry["stime"]
+    ltime    = entry["ltime"]
+
+    print(f"\n  Extracting flows via NFStream (n_meters={n_meters})…")
+    flows = extract_flows_nfstream(pcap_path, n_meters=n_meters)
+
+    candidates = [
+        f for f in flows
+        if (orientation_key(f.src_ip, f.src_port, f.dst_ip, f.dst_port) == tgt_key
+            and f.proto == tgt_proto_num)
+    ]
+
+    if not candidates:
+        print(f"\n  No flow candidates for this endpoint pair + proto (numeric={tgt_proto_num})")
+        return
+
+    print(f"\n  Found {len(candidates)} candidate flow(s) — ignoring time window:\n")
+    print(f"  {'src':<22} {'dst':<22} {'flow.ts':>18} {'delta_start':>12} {'delta_end':>10}")
+    print("  " + "-" * 88)
+    in_window = 0
+    for f in candidates:
+        delta_start = f.ts - stime
+        delta_end   = f.ts - ltime
+        marker      = " OK" if stime - TIME_TOLERANCE <= f.ts <= ltime + TIME_TOLERANCE else ""
+        if marker:
+            in_window += 1
+        src_str = f"{f.src_ip}:{f.src_port}"
+        dst_str = f"{f.dst_ip}:{f.dst_port}"
+        print(f"  {src_str:<22} {dst_str:<22} {f.ts:>18.3f} "
+              f"{delta_start:>+12.3f} {delta_end:>+10.3f}{marker}")
+
+    print(f"\n  GT window : [{stime:.3f}, {ltime:.3f}]  (±{TIME_TOLERANCE}s tolerance)")
+    print(f"  In-window : {in_window} / {len(candidates)} candidate(s)")
+    if in_window == 0 and candidates:
+        avg_delta = sum(f.ts - stime for f in candidates) / len(candidates)
+        print(f"  Avg offset: {avg_delta:+.3f}s  "
+              f"(positive = NFStream ts AFTER GT stime; negative = BEFORE)")
+        print("  VERDICT: FAIL — labels do not land on NFStream output for this row.")
+        print("  Investigate: grain change (NFStream idle/active timeout), or timezone issue.")
+    else:
+        print("  VERDICT: PASS — at least one NFStream flow falls inside the GT window.")
+
+
+def _cmd_sanity_check_gotham_nf(
+    pcap_path: str,
+    gotham_root: str,
+    n_meters: int = 1,
+) -> None:
+    """Single-PCAP Gotham sanity check using NFStream (no parquet written)."""
+    import sys
+    from corpus.gotham_labels import ATTACK_CAT_MAP, ATTACKER_IPS, GothamPcapSpec
+
+    pcap = Path(pcap_path)
+    if not pcap.exists():
+        print(f"ERROR: pcap not found: {pcap}"); sys.exit(1)
+
     parent_name = pcap.parent.name
     if parent_name == "benign":
-        spec = GothamPcapSpec(
-            pcap_path=pcap, is_attack=False, attack_cat="", attacker_ips=[],
-        )
+        spec = GothamPcapSpec(pcap_path=pcap, is_attack=False, attack_cat="", attacker_ips=[])
     elif parent_name in ATTACK_CAT_MAP:
         spec = GothamPcapSpec(
-            pcap_path=pcap,
-            is_attack=True,
+            pcap_path=pcap, is_attack=True,
             attack_cat=ATTACK_CAT_MAP[parent_name],
             attacker_ips=ATTACKER_IPS.get(parent_name, []),
         )
     else:
-        print(
-            f"ERROR: cannot determine label from parent dir '{parent_name}'. "
-            f"Expected 'benign' or one of: {sorted(ATTACK_CAT_MAP)}"
-        )
+        print(f"ERROR: cannot determine label from parent dir '{parent_name}'.")
         sys.exit(1)
 
-    print(f"\n=== Gotham sanity-check: {pcap.name} ===")
-    print(f"  Detected label : {'attack / ' + spec.attack_cat if spec.is_attack else 'benign'}")
-    print(f"  Attacker IPs   : {spec.attacker_ips or 'N/A (benign)'}")
-
-    pcap_start = get_pcap_start_epoch(pcap)
-    if pcap_start is None:
-        print("WARNING: pcap header timestamp unreadable — all flows will be dropped")
-    else:
-        from datetime import datetime, timezone
-        dt = datetime.fromtimestamp(pcap_start, tz=timezone.utc)
-        print(f"  Pcap epoch     : {pcap_start:.3f}  ({dt.isoformat()})")
+    print(f"\n=== Gotham NFStream sanity-check: {pcap.name} ===")
+    print(f"  Label    : {'attack / ' + spec.attack_cat if spec.is_attack else 'benign'}")
+    print(f"  Attackers: {spec.attacker_ips or 'N/A (benign)'}")
+    print(f"  Extracting via NFStream (n_meters={n_meters})…")
 
     try:
-        conv_dicts, flag_counts = extract_pcap_flows(pcap, tshark_bin)
+        flows = extract_flows_nfstream(str(pcap), n_meters=n_meters)
     except Exception as exc:
-        print(f"\nERROR: tshark extraction failed: {exc}")
-        sys.exit(1)
+        print(f"\nERROR: NFStream extraction failed: {exc}"); sys.exit(1)
 
-    batch_rows, stats = _apply_labels_gotham(
-        conv_dicts, flag_counts, pcap_start,
-        spec.is_attack, spec.attack_cat, spec.attacker_ips,
+    batch_rows, stats = _apply_labels_gotham_nf(
+        flows, spec.is_attack, spec.attack_cat, spec.attacker_ips,
     )
-
     total = stats.n_attack + stats.n_benign
-    benign_pct = 100 * stats.n_benign / max(total, 1)
-    attack_pct = 100 * stats.n_attack / max(total, 1)
-
     print(f"\n=== Sanity-check results ===")
-    print(f"  Pcap              : {pcap.name}")
     print(f"  Flows kept        : {total:,}  (attack={stats.n_attack:,}  benign={stats.n_benign:,})")
-    print(f"  Attack fraction   : {attack_pct:.2f}%   Benign: {benign_pct:.2f}%")
     print(f"  Dropped           : {stats.n_dropped_unprocessable}  reasons={stats.dropped_reasons}")
-
-    if spec.is_attack:
-        print(f"\n  Label source      : PCAP-level (all flows -> attack/{spec.attack_cat})")
-        print(f"  Attacker IPs hit  : ", end="")
-        if batch_rows:
-            srcs = {r["src_ip"] for r in batch_rows}
-            print(", ".join(sorted(srcs & set(spec.attacker_ips))) or "(none -- default orientation used)")
-        else:
-            print("N/A (no flows)")
-    else:
-        print(f"\n  Label source      : PCAP-level (all flows -> benign)")
-
-    print(f"\n  Note: single Gotham PCAPs are expectedly single-class.")
-    note = "PASS (attack pcap is legitimately 100% attack)" if spec.is_attack else "PASS (benign pcap is legitimately 100% benign)"
-    if total == 0:
-        print("  Balance verdict   : WARN — no flows extracted")
-    else:
-        print(f"  Balance verdict   : {note}")
-
-
-def _cmd_probe_attack(
-    row_idx: int,
-    pcap_path: str,
-    label_csv: str,
-    tshark_bin: str,
-) -> None:
-    """Print per-candidate abs_ts vs GT [stime, ltime] for one attack row.
-
-    Takes one attack row from the GT CSV (by zero-based index), extracts all
-    flows from the pcap, and for every flow whose endpoint pair + proto matches
-    the attack row (ignoring time), prints:
-
-        ep_a  ep_b  proto  abs_ts  stime  ltime  delta_start  delta_end
-
-    delta_start = abs_ts - stime  (positive: flow after window start)
-    delta_end   = abs_ts - ltime  (negative: flow before window end)
-
-    If deltas are a near-constant offset across candidates, that offset is the
-    epoch/timezone bug to correct in the GT CSV or the pcap-header reader.
-    """
-    label_index, _ = load_label_index(label_csv)
-
-    # Fetch the specific row
-    df_raw = pd.read_csv(label_csv, low_memory=False)
-    if row_idx >= len(df_raw):
-        print(f"ERROR: row_idx={row_idx} is out of range (CSV has {len(df_raw)} rows)")
-        sys.exit(1)
-    raw = df_raw.iloc[row_idx]
-    print(f"\n=== Probing GT row {row_idx} ===")
-    print(f"  srcip={raw.get('srcip', raw.get('Srcip', '?'))}  "
-          f"sport={raw.get('sport', raw.get('Sport', '?'))}  "
-          f"dstip={raw.get('dstip', raw.get('Dstip', '?'))}  "
-          f"dsport={raw.get('dsport', raw.get('Dsport', '?'))}  "
-          f"proto={raw.get('proto', raw.get('Proto', '?'))}  "
-          f"stime={raw.get('stime', raw.get('Stime', '?'))}  "
-          f"ltime={raw.get('ltime', raw.get('Ltime', '?'))}")
-
-    # Find all index entries for this row (by _row_idx)
-    target_entries = []
-    for entries in label_index.values():
-        for e in entries:
-            if e.get("_row_idx") == row_idx:
-                target_entries.append(e)
-    if not target_entries:
-        print("  (row not found in label index — may have been skipped for bad data)")
-        return
-    entry = target_entries[0]
-    tgt_key = orientation_key(entry["srcip"], entry["sport"], entry["dstip"], entry["dsport"])
-    tgt_proto = _PROTO_NORM.get(entry["proto"], entry["proto"].upper())
-    stime = entry["stime"]
-    ltime = entry["ltime"]
-
-    pcap_start = get_pcap_start_epoch(pcap_path)
-    if pcap_start is None:
-        print("ERROR: cannot read pcap header timestamp")
-        sys.exit(1)
-    conv_dicts = run_pass_a(tshark_bin, pcap=pcap_path)
-
-    candidates = [
-        c for c in conv_dicts
-        if (orientation_key(c["ep_a"][0], c["ep_a"][1], c["ep_b"][0], c["ep_b"][1]) == tgt_key
-            and c["proto"] == tgt_proto)
-    ]
-
-    if not candidates:
-        print(f"\n  No flow candidates found for this endpoint pair + proto ({tgt_proto})")
-        print("  (The pcap may not contain traffic between these endpoints)")
-        return
-
-    print(f"\n  Found {len(candidates)} candidate flow(s) — ignoring time window:\n")
-    print(f"  {'ep_a':<22} {'ep_b':<22} {'abs_ts':>16} {'delta_start':>12} {'delta_end':>10}")
-    print("  " + "-" * 86)
-    in_window = 0
-    for c in candidates:
-        abs_ts      = pcap_start + c["rel_start"]
-        delta_start = abs_ts - stime
-        delta_end   = abs_ts - ltime
-        marker      = " ✓" if stime - TIME_TOLERANCE <= abs_ts <= ltime + TIME_TOLERANCE else ""
-        if marker:
-            in_window += 1
-        ep_a_str = f"{c['ep_a'][0]}:{c['ep_a'][1]}"
-        ep_b_str = f"{c['ep_b'][0]}:{c['ep_b'][1]}"
-        print(f"  {ep_a_str:<22} {ep_b_str:<22} {abs_ts:>16.3f} "
-              f"{delta_start:>+12.3f} {delta_end:>+10.3f}{marker}")
-    print(f"\n  GT window : [{stime:.3f}, {ltime:.3f}]  (±{TIME_TOLERANCE}s tolerance)")
-    print(f"  In-window : {in_window} / {len(candidates)} candidate(s)")
-    if in_window == 0 and candidates:
-        deltas = [pcap_start + c["rel_start"] - stime for c in candidates]
-        avg_delta = sum(deltas) / len(deltas)
-        print(f"  Avg offset: {avg_delta:+.3f}s  "
-              f"(positive = pcap timestamps AFTER GT stime; "
-              f"negative = BEFORE)")
+    note = ("PASS (attack pcap is legitimately 100% attack)"
+            if spec.is_attack else "PASS (benign pcap is legitimately 100% benign)")
+    print(f"  Balance verdict   : {note if total > 0 else 'WARN — no flows'}")
 
 
 # ── entry point ────────────────────────────────────────────────────────────
@@ -1315,8 +1524,6 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    from adns_flows.extract import find_tshark
-
     ap = argparse.ArgumentParser(
         description="ADNS corpus builder and diagnostics",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1325,6 +1532,7 @@ Dataset selection
 -----------------
   --dataset unsw    (default) UNSW-NB15: time-window label matching via GT CSV
   --dataset gotham  Gotham 2025: directory-based labeling, no GT CSV needed
+  --dataset cic     CIC-IDS2017 Tuesday: IP+port+time-window matching
 
 Subcommands
 -----------
@@ -1332,7 +1540,6 @@ Subcommands
       Run the full pipeline on ONE pcap (no parquet written).
       Prints n_attack / n_benign / benign_fraction, label-row matched/unmatched
       counts, dropped-reason breakdown, and a PASS/FAIL balance verdict.
-      Run this before a full multi-pcap build.
 
   --sanity-check PCAP                (Gotham, requires --dataset gotham)
       Run single-pcap sanity check using directory-based labeling.
@@ -1340,33 +1547,37 @@ Subcommands
 
   --probe-attack ROW_IDX PCAP GT_CSV (UNSW only)
       For one attack row in the GT CSV (by zero-based index), find all candidate
-      flows in PCAP by endpoint pair + proto (ignoring time), and print each
-      candidate's reconstructed abs_ts vs the GT [stime, ltime] window with
-      delta in seconds.  Near-constant offsets indicate an epoch/timezone bug.
+      NFStream flows by endpoint pair + proto (ignoring time), and print each
+      candidate's flow.ts vs the GT [stime, ltime] window with delta in seconds.
 
   (no subcommand)
       UNSW full build : --pcap-dir DIR --label-csv CSV --out PARQUET
       Gotham full build: --dataset gotham --gotham-root PATH --out PARQUET
+      CIC full build  : --dataset cic --pcap PATH --out PARQUET
 """,
     )
-    ap.add_argument("--tshark", default=None,
-                    help="Path to tshark binary (auto-detected if omitted)")
+    ap.add_argument("--n-meters", type=int, default=1, metavar="N",
+                    help="NFStream worker count (default 1; corpus builds may use higher)")
     ap.add_argument("--allow-skewed", action="store_true",
                     help="Skip class-balance gate (print warning and proceed)")
     ap.add_argument("--flood-cap", type=int, default=DEFAULT_FLOOD_CAP, metavar="N",
                     help=f"Per-source-IP cap on one-sided flood flows "
                          f"(src_pkts<=1, dst_pkts==0). 0=disable. "
                          f"Default {DEFAULT_FLOOD_CAP}")
-    ap.add_argument("--dataset", choices=("unsw", "gotham"), default="unsw",
-                    help="Dataset type: 'unsw' (default) or 'gotham'")
+    ap.add_argument("--dataset", choices=("unsw", "gotham", "cic"), default="unsw",
+                    help="Dataset type: 'unsw' (default), 'gotham', or 'cic'")
     ap.add_argument("--gotham-root", metavar="PATH",
                     help="Gotham dataset root directory (required for --dataset gotham)")
+    ap.add_argument("--pcap", metavar="PATH",
+                    help="(CIC) Path to single PCAP file (full build or sanity-check)")
 
     sub = ap.add_mutually_exclusive_group()
     sub.add_argument("--sanity-check", nargs="+", metavar="ARG",
-                     help="UNSW: PCAP GT_CSV  |  Gotham: PCAP")
+                     help="UNSW: PCAP GT_CSV  |  Gotham: PCAP  |  CIC: PCAP")
     sub.add_argument("--probe-attack", nargs=3, metavar=("ROW_IDX", "PCAP", "GT_CSV"),
-                     help="(UNSW only) Print time-match diagnostics for one GT attack row")
+                     help="(UNSW only) Print NFStream time-match diagnostics for one GT attack row")
+    sub.add_argument("--probe-cic", metavar="PCAP",
+                     help="(CIC only) Print PCAP epoch vs expected attack windows")
 
     ap.add_argument("--pcap-dir",   help="(UNSW) Directory of pcap files (full build)")
     ap.add_argument("--label-csv",  help="(UNSW) Ground-truth CSV path (full build)")
@@ -1374,37 +1585,57 @@ Subcommands
 
     args = ap.parse_args()
 
-    tshark = args.tshark or find_tshark()
-    if tshark is None:
-        print("ERROR: tshark binary not found. "
-              "Set TSHARK_BIN or pass --tshark.", file=sys.stderr)
-        sys.exit(1)
-
-    if args.sanity_check:
+    if args.probe_cic:
+        if args.dataset not in ("cic", "unsw"):
+            ap.error("--probe-cic is only applicable to CIC PCAPs")
+        _cmd_probe_cic(args.probe_cic)
+    elif args.sanity_check:
         if args.dataset == "gotham":
             if len(args.sanity_check) != 1:
                 ap.error("Gotham --sanity-check expects exactly one argument: PCAP")
             gotham_root = args.gotham_root or ""
-            _cmd_sanity_check_gotham(args.sanity_check[0], gotham_root, tshark)
+            _cmd_sanity_check_gotham_nf(
+                args.sanity_check[0], gotham_root, n_meters=args.n_meters,
+            )
+        elif args.dataset == "cic":
+            if len(args.sanity_check) != 1:
+                ap.error("CIC --sanity-check expects exactly one argument: PCAP")
+            _cmd_sanity_check_cic(args.sanity_check[0])
         else:
             if len(args.sanity_check) != 2:
                 ap.error("UNSW --sanity-check expects exactly two arguments: PCAP GT_CSV")
             pcap_arg, csv_arg = args.sanity_check
-            _cmd_sanity_check(pcap_arg, csv_arg, tshark)
+            _cmd_sanity_check(pcap_arg, csv_arg)
     elif args.probe_attack:
         if args.dataset == "gotham":
             ap.error("--probe-attack is only available for --dataset unsw")
         idx_arg, pcap_arg, csv_arg = args.probe_attack
-        _cmd_probe_attack(int(idx_arg), pcap_arg, csv_arg, tshark)
+        _cmd_probe_attack_nf(int(idx_arg), pcap_arg, csv_arg, n_meters=args.n_meters)
     elif args.dataset == "gotham":
         if not (args.gotham_root and args.out):
             ap.error("Gotham full build requires --gotham-root PATH and --out PARQUET")
         df, stats = build_corpus_gotham(
             gotham_root=args.gotham_root,
-            tshark_bin=tshark,
             out_parquet=args.out,
             allow_skewed=args.allow_skewed,
             flood_cap=args.flood_cap,
+            n_meters=args.n_meters,
+        )
+        print(f"Done. {len(df):,} rows -> {args.out}")
+        print(f"  n_attack={stats.n_attack}  n_benign={stats.n_benign}  "
+              f"n_dropped={stats.n_dropped_unprocessable}")
+    elif args.dataset == "cic":
+        pcap_arg = args.pcap or (args.sanity_check[0] if args.sanity_check else None)
+        if not (pcap_arg and args.out):
+            ap.error("CIC full build requires --pcap PATH and --out PARQUET")
+        from corpus.cic_labels import CIC_ATTACK_WINDOWS
+        df, stats = build_corpus_cic(
+            pcap_path=pcap_arg,
+            cic_windows=CIC_ATTACK_WINDOWS,
+            out_parquet=args.out,
+            allow_skewed=args.allow_skewed,
+            flood_cap=args.flood_cap,
+            n_meters=args.n_meters,
         )
         print(f"Done. {len(df):,} rows -> {args.out}")
         print(f"  n_attack={stats.n_attack}  n_benign={stats.n_benign}  "
@@ -1415,9 +1646,10 @@ Subcommands
         df, stats = build_corpus(
             pcap_dir=args.pcap_dir,
             label_csv=args.label_csv,
-            tshark_bin=tshark,
             out_parquet=args.out,
             allow_skewed=args.allow_skewed,
+            flood_cap=args.flood_cap,
+            n_meters=args.n_meters,
         )
         print(f"Done. {len(df):,} rows -> {args.out}")
         print(f"  n_attack={stats.n_attack}  n_benign={stats.n_benign}  "

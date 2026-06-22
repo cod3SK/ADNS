@@ -207,6 +207,56 @@ def _ensure_npcap() -> None:
         )
 
 
+def _assign_job_object() -> None:
+    """Put this process in a Windows Job Object so all children die on forced exit."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        k32 = ctypes.windll.kernel32
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        JobObjectExtendedLimitInformation = 9
+
+        class _BasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit",     ctypes.c_longlong),
+                ("LimitFlags",             ctypes.c_ulong),
+                ("MinimumWorkingSetSize",   ctypes.c_size_t),
+                ("MaximumWorkingSetSize",   ctypes.c_size_t),
+                ("ActiveProcessLimit",      ctypes.c_ulong),
+                ("Affinity",               ctypes.c_size_t),
+                ("PriorityClass",          ctypes.c_ulong),
+                ("SchedulingClass",        ctypes.c_ulong),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [("_data", ctypes.c_ulonglong * 6)]
+
+        class _ExtInfo(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicInfo),
+                ("IoInfo",                _IoCounters),
+                ("ProcessMemoryLimit",    ctypes.c_size_t),
+                ("JobMemoryLimit",        ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed",     ctypes.c_size_t),
+            ]
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        info = _ExtInfo()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = k32.SetInformationJobObject(
+            job, JobObjectExtendedLimitInformation,
+            ctypes.byref(info), ctypes.sizeof(info),
+        )
+        if ok:
+            k32.AssignProcessToJobObject(job, k32.GetCurrentProcess())
+    except Exception:
+        pass
+
+
 def _build_tray(window):
     """Create and return a pystray Icon wired to the webview window."""
     import pystray
@@ -219,9 +269,9 @@ def _build_tray(window):
         window.show()
 
     def on_quit(icon, item):
-        # Stop tshark before killing the process.
         try:
-            from app import _capture_agent, _batch_capture_agent  # noqa: PLC0415
+            from app import _capture_agent, _batch_capture_agent, _nfstream_capture_agent  # noqa: PLC0415
+            _nfstream_capture_agent.stop()
             _capture_agent.stop()
             _batch_capture_agent.stop()
         except Exception:
@@ -243,11 +293,16 @@ def _build_tray(window):
 
 
 def main() -> None:
-    if sys.platform == "win32" and not _is_admin():
+    _assign_job_object()
+
+    headless = "--headless" in sys.argv
+
+    if not headless and sys.platform == "win32" and not _is_admin():
         _elevate()
         return
 
-    _ensure_npcap()
+    if not headless:
+        _ensure_npcap()
 
     data_dir = _data_dir()
 
@@ -269,7 +324,7 @@ def main() -> None:
                 "Port 5000 may be in use. Open Task Manager, close anything on port 5000, then try again."
             )
 
-    # Flask is up — auto-start both capture agents on the detected interface.
+    # Flask is up — auto-start capture agents on the detected interface.
     try:
         urllib.request.urlopen(
             urllib.request.Request(
@@ -281,19 +336,31 @@ def main() -> None:
             timeout=10,
         )
     except Exception:
-        pass  # app starts fine even if capture can't start (e.g. no tshark)
+        pass  # app starts fine even if capture can't start (e.g. no Npcap)
 
-    # Register cleanup so tshark subprocesses are terminated on exit.
+    # Register cleanup so subprocesses are terminated on normal exit.
     # Windows does not auto-kill child processes when the parent exits.
     def _stop_capture():
         try:
-            from app import _capture_agent, _batch_capture_agent  # noqa: PLC0415
+            from app import _capture_agent, _batch_capture_agent, _nfstream_capture_agent  # noqa: PLC0415
+            _nfstream_capture_agent.stop()
             _capture_agent.stop()
             _batch_capture_agent.stop()
         except Exception:
             pass
 
     atexit.register(_stop_capture)
+
+    if headless:
+        # No webview or tray — keep the process alive until killed externally.
+        # Used by the smoke-test suite (step4_smoke_test.py).
+        print(f"ADNS headless: Flask running on http://127.0.0.1:5000  PID={os.getpid()}", flush=True)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        sys.exit(0)
 
     import webview  # noqa: PLC0415  (not available in test env)
 
@@ -325,4 +392,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

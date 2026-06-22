@@ -1,0 +1,1 @@
+api/model_artifacts/*.joblib filter=lfs diff=lfs merge=lfs -text

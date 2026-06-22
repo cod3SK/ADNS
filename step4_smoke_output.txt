@@ -1,0 +1,45 @@
+Smoke-testing: X:\ADNS\dist\ADNS\ADNS.exe
+PID: 5024
+
+[2.0] Startup ...
+  [PASS] 2.0 startup: Flask up in <45s, PID=21884
+
+[2.1] PCAP read / model check ...
+  [PASS] 2.1a capture_status has nfstream key: keys=['batch', 'extractor', 'interface', 'live', 'nfstream', 'tshark_found', 'version']
+  [PASS] 2.1b model_status responds: status=ok
+
+[2.2] Live capture (15s) ...
+  [PASS] 2.2a autostart: response={'extractor': 'nfstream', 'interface': {'device': '\\Device\\NPF_{E466F43A-35D6-409B-AC2B-A026C362E238}', 'name': 'Wi-Fi'}, 'status': 'ok'}
+    Waiting 15s for flows ...
+  [PASS] 2.2b nfstream running: running=True, flows=0, error=None
+  [PASS] 2.2c no DLL/capture error: last_error=None
+
+[2.4] Detection + attribution ...
+  [PASS] 2.4a /flows returns data: 3 flows returned
+  [PASS] 2.4b nfstream agent healthy: running=True, error=None
+  [PASS] 2.4c non-zero scores: 3 flows with score field, any non-zero=True
+
+  Stopping primary instance ...
+
+[2.3] Forced-shutdown orphan check ...
+  [PASS] 2.3a startup for shutdown test: PID=8916
+    taskkill /F /PID 8916 ...
+  [PASS] 2.3b zero orphans after forced kill: 0 orphan(s) found: []
+
+============================================================
+SMOKE TEST RESULTS
+============================================================
+  [PASS] 2.0 startup
+  [PASS] 2.1a capture_status has nfstream key
+  [PASS] 2.1b model_status responds
+  [PASS] 2.2a autostart
+  [PASS] 2.2b nfstream running
+  [PASS] 2.2c no DLL/capture error
+  [PASS] 2.4a /flows returns data
+  [PASS] 2.4b nfstream agent healthy
+  [PASS] 2.4c non-zero scores
+  [PASS] 2.3a startup for shutdown test
+  [PASS] 2.3b zero orphans after forced kill
+
+  11/11 passed
+  OVERALL: PASS — frozen exe is smoke-test green.
