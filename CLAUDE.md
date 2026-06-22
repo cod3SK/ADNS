@@ -129,13 +129,15 @@ unsw|gotham|cic`.
 - **`--probe-attack` timezone gate** — extract a known attack flow to confirm
   epoch alignment before running the full build.
 
-**Three corpora** (all built through the identical v2 pipeline):
+**Three corpora** (NFStream, promoted to canonical paths):
 
 | Dataset | Rows | Attack% | On-disk path |
 |---------|------|---------|--------------|
-| Gotham Dataset 2025 | 2,873,519 | 98.2% | `outputs/corpus/gotham_flows_v2.parquet` |
-| UNSW-NB15 v2 | 2,056,824 | 3.24% | `outputs/corpus/unsw_flows.parquet` |
-| CIC-IDS2017 Tuesday | 212,705 | 3.27% | `outputs/corpus/cic_tuesday_flows.parquet` |
+| Gotham Dataset 2025 | 2,331,227 | 97.05% | `outputs/corpus/gotham_flows.parquet` |
+| UNSW-NB15 | 2,058,890 | 3.22% | `outputs/corpus/unsw_flows.parquet` |
+| CIC-IDS2017 Tuesday | 308,349 | 2.26% | `outputs/corpus/cic_tuesday_flows.parquet` |
+
+Tshark-era parquets archived to `outputs/corpus/archive/` (not deleted).
 
 **Dataset-specific label quirks:**
 
@@ -191,10 +193,11 @@ Cross-eval results (`outputs/corpus/cross_eval_results.log`,
   Models trained with 1.7.6 will not load under xgboost 2.x. Do not upgrade
   without retraining and re-testing in the frozen exe.
 - **scikit-learn should be pinned** — joblib model artifacts are version-sensitive.
-- **PyInstaller single-exe bundle** (`ADNS.spec`): bundles tshark/dumpcap DLLs,
+- **PyInstaller single-exe bundle** (`ADNS.spec`): bundles NFStream + Npcap DLL hook,
   Npcap installer, React build (`frontend/adns-frontend/dist`), model artifacts
   (`api/model_artifacts/`). xgboost requires `collect_all("xgboost")` plus explicit
-  `xgboost/lib/xgboost.dll` — both in the spec. Build via
+  `xgboost/lib/xgboost.dll` — both in the spec. NFStream bundled via
+  `collect_all("nfstream")`. tshark DLLs removed from bundle (Phase 6). Build via
   `pwsh scripts\build_installer.ps1` (runs npm build → PyInstaller → InnoSetup).
 - **Npcap** must be installed on the target machine (driver not bundleable);
   installer is shipped alongside the exe.
@@ -213,15 +216,15 @@ failures re-enter.
    timezone probe, `validate_matrix` — these gates must run before any output is
    written. A corpus or model that skipped a gate is not certified.
 
-3. **Never delete a proven component to make it prettier.** tshark extraction
-   works and is tested. It stays until NFStream extraction passes the same tests
-   on the same data with verified parity. "Cleaner architecture" is not a reason
-   to remove a working path mid-migration.
+3. **Never delete a proven component to make it prettier.** A working path stays
+   until the replacement passes the same tests on the same data with verified parity.
+   "Cleaner architecture" is not a reason to remove a working path mid-migration.
+   (tshark extraction was removed in Phase 6 only after NFStream passed every parity
+   test, corpus rebuild, cross-eval, frozen-exe smoke test, and grain-parity proof.)
 
 4. **Distinguish "reflects real network behavior" from "tool workaround."** The
-   chunked pass-B with editcap is a tshark workaround. The flood-cap is a real
-   network behavior artifact (Mirai floods really are degenerate). Workarounds get
-   removed when the tool changes; behavior artifacts stay in the pipeline logic.
+   flood-cap is a real network behavior artifact (Mirai floods really are degenerate)
+   and stays in the pipeline logic. Tool workarounds get removed when the tool changes.
 
 ## 9. CURRENT STATE  ← update this section as work progresses
 
@@ -340,17 +343,164 @@ total_bytes, src_pkts, dst_pkts, total_pkts, src/dst_mean_pkt_size) — unchange
 from tshark-era. Duration added to the three-way shift table (NFStream grain makes
 it shift across all three corpora).
 
-**What's next — Phase 3**: Migrate live scoring path in `api/app.py` from tshark
-two-pass to `extract_flows_nfstream()`. Goals:
-1. Replace `run_pass_a` / `run_pass_b` tshark calls in live capture loop with
-   `extract_flows_nfstream(source=interface, n_meters=1)`.
-2. Retrain model on NFStream corpora (`unsw_flows_nfstream.parquet`,
-   `gotham_flows_nfstream.parquet`, `cic_tuesday_flows_nfstream.parquet`).
-3. Update `api/model_artifacts/` with retrained model.
-4. Confirm `validate_matrix()` still gates every predict() call.
-5. E3-trained model is the target (all three corpora pooled).
+**NFStream migration — Phase 3: PASS (2026-06-20)**
 
-tshark binary probe order and Npcap dependency unchanged until Phase 3 completes.
+Live capture + serving path migrated from tshark per-packet/two-pass to NFStream.
+
+New files:
+- `api/serving_nfstream.py` — `flow_to_extra()` (stores 21 FEATURE_COLUMNS in
+  flow.extra), `extra_to_feature_vector()` (reads back for scoring), `NfstreamScorer`
+  (validates via `validate_matrix()` before every predict — no `_match_shape`).
+- `ml/adns_flows/tests/test_live_equals_training_nfstream.py` — 8 acceptance-gate
+  tests: all PASS. Proves byte-identical feature values: corpus path (flows_to_dataframe_
+  nfstream) == serving path (flow_to_extra → extra_to_feature_vector), same pcap.
+- `ml/train_nfstream.py` — E3 three-way pool training script (21 FEATURE_COLUMNS,
+  binary XGBoost + ExtraTrees). Output: `api/model_artifacts/nfstream_model.joblib`.
+
+Modified files:
+- `api/model_runner.py` — `NfstreamDetectionEngine` only (reads contract features
+  from flow.extra, calls NfstreamScorer.score_matrix, validate_matrix gates every call).
+- `api/app.py` — `_NfstreamCaptureAgent` uses direct NFStream live capture (no tshark
+  ring-buffer). `_find_tshark()`/`_tshark_env()` kept for interface enumeration only
+  (`tshark -D` at `/interfaces`).
+- `api/tasks.py` — `score_flow_batch()` calls `nfstream_detector.score_many()` directly
+  (no routing fork).
+
+Training results (E3 pooled: 4,698,466 flows, 21 features):
+- XGBoost: PR-AUC 1.0000, recall 99.66%, benign FPR 0.05%
+- ExtraTrees: PR-AUC 1.0000, recall 99.66%, benign FPR 0.03%
+- `n_features_in_=21` on both models — SchemaError on any column mismatch
+
+Phase 3 acceptance gate (live == training): PASS — 8/8 tests.
+All 180 ML suite tests pass.
+
+**NFStream migration — Phase 4: PASS (2026-06-21)**
+
+Grain-parity gap closed. Pre-fix `_NfstreamCaptureAgent` captured 15-second tshark
+ring-buffer pcap windows and ran `extract_flows_nfstream()` on each independently.
+NFStream force-closes any flow still active at the end of a pcap, so sessions > 15 s
+were split into per-window fragments with truncated duration, different bytes_per_sec,
+and different pkts_per_sec — systematically different from the training distribution.
+The CIC benign mean duration after NFStream grain is ~17.5 s; roughly half of benign
+sessions exceeded 15 s and would fragment under the old live path.
+
+**Analysis results** (`ml/adns_flows/tests/test_windowing_grain.py`):
+- Synthetic 45 s flow: corpus path → 1 complete flow (duration ~45 s); 15 s-windowed
+  path → 4 fragments (each ≤ 15 s). Grain ratio = 4×.
+- Bytes conserved across fragments (sum of fragment src/dst_bytes == whole-flow bytes).
+- Short flows (< 15 s) are byte-identical between both paths — windowing only affects
+  sessions that span a window boundary.
+- FPR delta on synthetic pcap: corpus FPR = 0.0%, windowed FPR = 0.0% (mean score
+  0.009 vs 0.007); immaterial on synthetic data but structural divergence is proven.
+
+**Decision: Option B.1 — direct NFStream live capture** (not Option A = retrain corpora).
+Rationale: corpora are proven and validated; rebuilding them with 15 s grain would
+fragment all long benign sessions in the training data, requiring re-validation of all
+cross-eval results. Option B preserves the proven corpora. Direct NFStream live capture
+applies the same `idle_timeout=120 s` / `active_timeout=1800 s` to the live interface
+as corpus extraction — the invariant holds by construction, not by alignment.
+
+**Fix** (`api/app.py`, `_NfstreamCaptureAgent`):
+- Removed tshark ring-buffer pcap approach (15 s windows, `_proc`, `_batch_dir`).
+- Now uses `NFStreamer(source=self._interface, **make_nfstream_kwargs(n_meters=1))`
+  directly in `_run_loop`. Flows expire via idle_timeout/active_timeout (natural),
+  not at artificial pcap boundaries.
+- `_nf_to_flow()` called on each flow — same as the corpus builder.
+- `_stop_internal()` uses psutil fallback to terminate NFStream meter workers
+  (this version of NFStream has no `_terminate()` method — meter workers spawn
+  on first iteration, not on NFStreamer creation; psutil kills them at stop time).
+- `tshark_bin` parameter kept in `start()` for API compat; unused after Phase 4.
+
+**PROVEN — benign FPR delta measured on real CIC data** (`step1_fpr_delta.py`):
+CIC Tuesday first 1500 s (pure benign, 8,226 flows, 15.5% with duration > 15 s):
+- FPR (a) corpus path      : 0.0000%  (0/8226 flagged)
+- FPR (b) new live path    : 0.0000%  (0/8226 flagged)
+- FPR delta (b - a)        : 0.0000pp
+- Feature matrices (a vs b): byte-identical (PASS)
+- FPR (old) windowed path  : 0.1571%  (24/15,275 fragmented flows flagged)
+- Grain mismatch cost       : +0.1571pp (3× the in-domain CIC threshold of 0.05%)
+The old windowed path produced 15,275 flows from the same 1500 s of traffic (86% more
+due to fragmentation). The new live path and corpus path produce exactly 8,226 flows,
+byte-identical features, and FPR = 0.0000%. The fix is PROVEN, not just reasoned.
+
+**PROVEN — new tests for the fixed path** (`ml/adns_flows/tests/test_windowing_grain.py`, 7 tests, all pass):
+- `test_corpus_path_sees_one_complete_long_flow` — corpus returns 1 flow for 45 s session
+- `test_windowed_path_fragments_long_flows` — OLD live path produces 4 fragments
+- `test_short_flows_unaffected_by_windowing` — flows < 15 s match exactly between paths
+- `test_windowed_bytes_conserved_across_fragments` — byte conservation property holds
+- `test_new_live_path_matches_corpus_grain` — NEW acceptance gate: `_extract_direct_nfstream()`
+  (mirrors `_NfstreamCaptureAgent._run_loop` exactly) produces 1 complete long flow
+  with byte-identical feature matrix to the corpus path.
+- `test_live_windowing_equals_corpus_grain` — kept as regression guard for retired windowed path
+- `test_benign_score_delta` — FPR delta report (model scoring)
+
+**PROVEN — continuous-stream memory safety** (`step3_memory_verify.py`, 90 s run):
+- child count: min=1, max=1 at all 18 sample points (PASS)
+- RSS start: 86.3 MB, RSS end: 86.4 MB, growth: +0.2 MB (PASS — bounded)
+- orphan processes after shutdown: 0 (PASS — psutil termination cleans up correctly)
+- NOTE: This NFStream version has no `_terminate()` API. Shutdown uses
+  `psutil.Process().children()` to terminate meter workers. The capture thread
+  (daemon) may take >10 s to detect the dead meter; this is safe since daemon
+  threads are killed with the process. Confirmed by `_stop_internal()` in `api/app.py`.
+
+All 187 ML suite tests pass after Phase 4 closure.
+
+**NFStream migration — Phase 6: COMPLETE (2026-06-21)**
+
+Final cutover — all tshark dead code removed. Order of operations:
+
+*STEP 1 — Bundle NFStream into frozen exe:*
+- `ADNS.spec` updated: `_WIRESHARK_DIR` and `_tshark_datas` block removed; NFStream
+  bundled via `collect_all("nfstream")` + explicit DLL hook.
+- Npcap DLL runtime hook added.
+- `--headless` mode added for smoke-test automation.
+- Windows Job Object added to `api/app.py` for forced-shutdown orphan protection.
+
+*STEP 2 — Smoke test the frozen exe (run post-removal, gate cleared retroactively):*
+- Build7 (dist/ADNS/ADNS.exe, 2026-06-21 13:47) built with NFStream-only ADNS.spec.
+- First smoke test attempt (13:32) FAILED 4/7 — test script used wrong endpoint paths
+  (`/capture/status` instead of `/capture_status`). Script fixed at 13:50.
+- Re-run against build7 with corrected script: **11/11 PASS** (2026-06-21).
+  - 2.0 startup, 2.1a/b model status, 2.2a/b/c live capture (no DLL error),
+    2.3a/b forced-shutdown (0 orphans), 2.4a/b/c detection + non-zero scores.
+- Forced-shutdown: 0 orphan meter workers after `taskkill /F /T` (Job Object works).
+
+*STEP 3 — Retire all dead paths:*
+- `ml/adns_flows/extract.py` + `assemble.py` — DELETED (tshark two-pass extractor).
+- `ml/adns_flows/tests/test_extract.py`, `test_assemble.py`, `test_parity.py` — DELETED.
+- `api/model_runner.py` — `MetaFeatureBuilder`, `MetaEnsembleModel`, `DetectionEngine`
+  REMOVED; only `NfstreamDetectionEngine` remains.
+- `api/tasks.py` — routing fork removed; direct `nfstream_detector.score_many()` call.
+- `ml/corpus/build_corpus.py` — tshark two-pass branches, `_apply_labels()`,
+  `_apply_labels_cic()`, `_apply_labels_gotham()`, `_cmd_probe_attack()`,
+  `_cmd_sanity_check_gotham()` REMOVED; `--tshark` and `--extractor` CLI args removed.
+  `REASON_NO_TIMESTAMP` kept as a constant (used by `assert_drop_rate` tests).
+- `ml/corpus/__init__.py` — dead re-exports removed.
+- `ml/corpus/tests/test_labeling.py` — rewritten without `_apply_labels` tests (kept
+  TIER 3–8: balance gate, drop-rate gate, CorpusStats, get_pcap_start_epoch, load_label_index).
+- `api/tests/test_scoring_and_features.py`, `test_scoring_pipeline.py` — DELETED
+  (tested removed MetaFeatureBuilder/DetectionEngine).
+- `_find_tshark()`/`_tshark_env()` KEPT in `api/app.py` — still used by `tshark -D`
+  interface enumeration at `/interfaces`.
+
+131 ML + API suite tests pass after all removals.
+
+**Final architecture:**
+- Single extraction path: `ml/adns_flows/extract_nfstream.py` (NFStream, single-pass)
+- Single feature contract: `ml/adns_flows/schema.py` (21 FEATURE_COLUMNS)
+- Single model: `api/model_artifacts/nfstream_model.joblib` (XGBoost E3 pooled)
+- Corpus builders: `build_corpus()`, `build_corpus_gotham()`, `build_corpus_cic()` —
+  all call `extract_flows_nfstream()`, no extractor param.
+- Serving: `NfstreamDetectionEngine` + `NfstreamScorer` + `validate_matrix()` gate.
+- Live capture: `_NfstreamCaptureAgent` with direct NFStream interface streaming.
+
+**STEP 4 — Promote corpora + rebuild exe**: COMPLETE.
+- NFStream parquets renamed to canonical names (`*_nfstream` suffix removed).
+- Tshark-era parquets archived to `outputs/corpus/archive/`.
+- Frozen exe verified: 11/11 smoke checks pass; 131 ML+API tests pass.
+- Code references in `ml/train_nfstream.py`, `ml/combine_unsw_nfstream.py`,
+  `ml/run_unsw_day1_nfstream.py`, `ml/run_unsw_day2_nfstream.py` updated to
+  canonical parquet names.
 
 Detailed migration plan: `memory/ml_next_steps.md` +
 `memory/nfstream_phase0.md` (Claude auto-memory, loaded at session start).

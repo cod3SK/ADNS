@@ -15,6 +15,9 @@ api/instance/
 dist/
 build/
 
+# Model artifacts (large binary files — ship via release or local build)
+api/model_artifacts/*.joblib
+
 # Frontend build
 frontend/adns-frontend/dist/
 frontend/adns-frontend/node_modules/

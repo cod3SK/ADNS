@@ -18,8 +18,9 @@ from sqlalchemy import inspect, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 
 import numpy as np
-from model_runner import DetectionEngine, MetaFeatureBuilder
+from model_runner import NfstreamDetectionEngine
 from task_queue import enqueue_flow_scoring
+from serving_nfstream import flow_to_extra
 
 try:
     from _version import __version__ as _APP_VERSION
@@ -188,10 +189,7 @@ def init_db() -> None:
 
 
 def ensure_flow_extra_column() -> None:
-    """
-    Older deployments created the flows table before `extra` existed. Ensure the
-    JSON column is present so inserts from the tshark agent succeed.
-    """
+    """Add flows.extra column if absent (older deployments predated it)."""
     try:
         inspector = inspect(db.engine)
         columns = {col["name"] for col in inspector.get_columns("flows")}
@@ -409,7 +407,7 @@ def block_ip_os(ip: str, allow: bool = False) -> tuple[bool, str]:
     return _block_ip_iptables(ip, allow)
 
 
-simulation_detector = DetectionEngine()
+_simulation_scorer = NfstreamDetectionEngine()
 
 
 def _infer_scanning(flow) -> str | None:
@@ -828,33 +826,6 @@ def enforce_batch_flow_retention() -> int:
     return purged
 
 
-# ---------------------------------------------------------------
-# Tshark capture helpers — in-process packet ingestion
-# ---------------------------------------------------------------
-
-_TSHARK_FIELDS = [
-    "frame.time_epoch", "ip.src", "ip.dst", "ip.proto", "frame.len",
-    "tcp.srcport", "tcp.dstport", "udp.srcport", "udp.dstport",
-    "dns.qry.name", "dns.qry.type", "dns.qry.class", "dns.flags.rcode",
-    "http.request.method", "http.request.full_uri", "http.user_agent",
-    "http.response.code", "http.content_length",
-    "ssl.handshake.version", "ssl.handshake.ciphersuite",
-]
-
-_TSHARK_PROTO_MAP = {
-    "1": "ICMP", "6": "TCP", "17": "UDP", "47": "GRE",
-    "50": "ESP", "51": "AH", "58": "ICMPV6", "132": "SCTP",
-}
-
-_TSHARK_SERVICE_PORTS = {
-    20: "ftp", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp",
-    53: "dns", 67: "dhcp", 68: "dhcp", 80: "http", 110: "pop3",
-    123: "ntp", 135: "rpc", 143: "imap", 161: "snmp", 389: "ldap",
-    443: "https", 445: "smb", 465: "smtps", 993: "imaps", 995: "pop3s",
-    1433: "mssql", 1521: "oracle", 3306: "mysql", 3389: "rdp", 5060: "sip",
-}
-
-
 def _find_tshark() -> str | None:
     # Bundled copy is preferred: launcher ensures admin rights + Npcap before we get here.
     if hasattr(sys, "_MEIPASS"):
@@ -882,328 +853,43 @@ def _tshark_env(tshark_bin: str) -> dict:
     return env
 
 
-def _ts_safe_float(value: str, fallback: float) -> float:
-    try:
-        return float(value) if value else fallback
-    except ValueError:
-        return fallback
+class _NfstreamCaptureAgent:
+    """NFStream live capture agent: uses NFStreamer(source=interface) directly.
 
+    Direct capture matches corpus extraction grain exactly:
+      - idle_timeout=120 s / active_timeout=1800 s govern flow expiry on the live
+        interface — the same timeouts the corpus builder applied to whole pcaps.
+      - No artificial pcap boundary force-closes an active flow mid-session.
+      - Each flow object is converted by _nf_to_flow(), identical to the corpus path.
+    """
 
-def _ts_safe_int(value: str) -> int | None:
-    if not value:
-        return None
-    try:
-        return int(value, 16) if value.lower().startswith("0x") else int(value)
-    except ValueError:
-        digits = "".join(ch for ch in value if ch.isdigit())
-        return int(digits) if digits else None
-
-
-def _ts_proto(value: str) -> str:
-    v = (value or "").strip()
-    if not v:
-        return "OTHER"
-    return _TSHARK_PROTO_MAP.get(v, v.upper()) if v.isdigit() else v.upper()
-
-
-def _ts_service(proto, src_port, dst_port, dns_query, http_method, ssl_version):
-    if http_method:
-        return "http"
-    if ssl_version is not None or dst_port in {443, 8443}:
-        return "https"
-    if dns_query or dst_port == 53:
-        return "dns"
-    port = dst_port or src_port
-    return _TSHARK_SERVICE_PORTS.get(port, proto.lower()) if port else proto.lower()
-
-
-def _parse_tshark_line(line: str) -> dict | None:
-    n = len(_TSHARK_FIELDS)
-    parts = line.split("\t")
-    if len(parts) < n:
-        parts += [""] * (n - len(parts))
-    elif len(parts) > n:
-        parts = parts[:n]
-
-    src = parts[1] or ""
-    dst = parts[2] or ""
-    if not src or not dst:
-        return None
-
-    proto = _ts_proto(parts[3])
-    length = max(0, _ts_safe_int(parts[4]) or 0)
-    src_port = _ts_safe_int(parts[5]) or _ts_safe_int(parts[7]) or 0
-    dst_port = _ts_safe_int(parts[6]) or _ts_safe_int(parts[8]) or 0
-    dns_query = parts[9].strip()
-    dns_qtype = _ts_safe_int(parts[10])
-    dns_qclass = _ts_safe_int(parts[11])
-    dns_rcode = _ts_safe_int(parts[12])
-    http_method = parts[13].strip()
-    http_uri = parts[14].strip()
-    http_user_agent = parts[15].strip()
-    http_status = _ts_safe_int(parts[16])
-    http_content_len = _ts_safe_int(parts[17])
-    ssl_version = _ts_safe_int(parts[18])
-    ssl_cipher = parts[19].strip()
-
-    service = _ts_service(proto, src_port, dst_port, dns_query or None, http_method or None, ssl_version)
-
-    rec: dict = {
-        "ts": _ts_safe_float(parts[0], time.time()),
-        "src_ip": src, "dst_ip": dst, "proto": proto,
-        "bytes": length, "score": 0.0, "duration": 0.01,
-        "src_bytes": length, "dst_bytes": 0, "src_pkts": 1, "dst_pkts": 0,
-    }
-    if src_port: rec["src_port"] = src_port
-    if dst_port: rec["dst_port"] = dst_port
-    if service: rec["service"] = service
-    if dns_query: rec["dns_query"] = dns_query
-    if dns_qtype is not None: rec["dns_qtype"] = dns_qtype
-    if dns_qclass is not None: rec["dns_qclass"] = dns_qclass
-    if dns_rcode is not None: rec["dns_rcode"] = dns_rcode
-    if http_method: rec["http_method"] = http_method
-    if http_uri: rec["http_uri"] = http_uri
-    if http_user_agent: rec["http_user_agent"] = http_user_agent
-    if http_status is not None: rec["http_status_code"] = http_status
-    if http_content_len is not None:
-        key = "http_request_body_len" if http_method else "http_response_body_len"
-        rec[key] = http_content_len
-    if ssl_version is not None: rec["ssl_version"] = ssl_version
-    if ssl_cipher: rec["ssl_cipher"] = ssl_cipher
-    return rec
-
-
-def _build_tshark_cmd(tshark_bin: str, interface: str) -> list[str]:
-    cmd = [tshark_bin, "-i", interface, "-T", "fields"]
-    for field in _TSHARK_FIELDS:
-        cmd.extend(["-e", field])
-    cmd.extend(["-Y", "ip", "-l", "-E", "separator=\t", "-E", "header=n"])
-    return cmd
-
-
-class _CaptureAgent:
-    """Manages a tshark subprocess and ingests parsed flows directly into the DB."""
+    _BATCH_SIZE    = 200
+    _FLUSH_INTERVAL = 5.0  # seconds between DB flushes
 
     def __init__(self) -> None:
-        self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._interface: str | None = None
-        self._start_time: float | None = None
-        self._flows_captured = 0
-        self._last_ingest: datetime | None = None
-        self._last_error: str | None = None
-        self._stop_evt = threading.Event()
-
-    def start(self, interface: str, tshark_bin: str) -> None:
-        with self._lock:
-            self._stop_internal()
-            self._stop_evt.clear()
-            self._interface = interface
-            self._flows_captured = 0
-            self._last_ingest = None
-            self._last_error = None
-            self._start_time = time.time()
-            try:
-                self._proc = subprocess.Popen(
-                    _build_tshark_cmd(tshark_bin, interface),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    bufsize=1,
-                    cwd=os.path.dirname(os.path.abspath(tshark_bin)),
-                    env=_tshark_env(tshark_bin),
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                )
-            except Exception as exc:
-                self._last_error = str(exc)
-                self._start_time = None
-                raise
-            self._thread = threading.Thread(
-                target=self._reader_loop, args=(self._proc,), daemon=True,
-            )
-            self._thread.start()
-
-    def stop(self) -> None:
-        with self._lock:
-            self._stop_internal()
-
-    def _stop_internal(self) -> None:
-        self._stop_evt.set()
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-        self._proc = None
-        self._start_time = None
-
-    @property
-    def running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
-
-    def status(self) -> dict:
-        tshark_path = _find_tshark()
-        uptime = round(time.time() - self._start_time, 1) if self._start_time and self.running else None
-        return {
-            "running": self.running,
-            "interface": self._interface,
-            "tshark_found": tshark_path is not None,
-            "tshark_path": tshark_path,
-            "flows_captured": self._flows_captured,
-            "last_ingest": self._last_ingest.isoformat() if self._last_ingest else None,
-            "uptime_seconds": uptime,
-            "last_error": self._last_error,
-        }
-
-    def _reader_loop(self, proc: subprocess.Popen) -> None:
-        buf: list[dict] = []
-        last_flush = time.time()
-        BATCH_SIZE = 50
-        FLUSH_INTERVAL = 2.0
-
-        try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                if self._stop_evt.is_set():
-                    break
-                rec = _parse_tshark_line(line.strip())
-                if rec:
-                    buf.append(rec)
-                now = time.time()
-                if buf and (len(buf) >= BATCH_SIZE or now - last_flush >= FLUSH_INTERVAL):
-                    batch, buf = buf, []
-                    last_flush = now
-                    self._ingest_batch(batch)
-        except Exception as exc:
-            self._last_error = str(exc)
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-
-    def _ingest_batch(self, batch: list[dict]) -> None:
-        try:
-            with app.app_context():
-                blocked_set = {r.ip for r in BlockedIP.query.filter_by(active=True).all()}
-                flow_records: list[Flow] = []
-                for rec in batch:
-                    src_ip = rec.get("src_ip", "")
-                    dst_ip = rec.get("dst_ip", "")
-                    if not src_ip or src_ip in blocked_set or dst_ip in blocked_set:
-                        continue
-                    flow_records.append(Flow(
-                        timestamp=parse_timestamp(rec.get("ts")),
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        proto=normalize_protocol(rec.get("proto", "")),
-                        bytes=int(rec.get("bytes") or 0),
-                        extra=build_flow_extra(rec),
-                    ))
-                    db.session.add(flow_records[-1])
-                if flow_records:
-                    db.session.flush()
-                    flow_ids = [f.id for f in flow_records]
-                    db.session.commit()
-                    enforce_flow_retention()
-                    enqueue_flow_scoring(flow_ids)
-                    with self._lock:
-                        self._flows_captured += len(flow_records)
-                        self._last_ingest = datetime.now(timezone.utc)
-        except Exception as exc:
-            self._last_error = str(exc)
-            app.logger.exception("capture batch ingest failed: %s", exc)
-
-
-_capture_agent = _CaptureAgent()
-
-
-# ---------------------------------------------------------------
-# Batch capture agent — ring-buffer tshark + two-pass pcap processing
-# ---------------------------------------------------------------
-
-# tshark 4.x conv output has no pipe chars in data rows; bytes use human units (bytes/kB/MB/GB).
-# Example data line (header pipes are decorative):
-#   10.0.0.1:443  <->  192.168.1.2:58432    12 1530 bytes    58 85 kB    70 87 kB    0.000000  30.1234
-_BATCH_CONV_RE = re.compile(
-    r"(\S+):(\d+)\s+<->\s+(\S+):(\d+)\s+"
-    r"(\d+)\s+([\d.]+)\s+(\S+)\s+"   # frames_ba  bytes_ba_val  bytes_ba_unit
-    r"(\d+)\s+([\d.]+)\s+(\S+)\s+"   # frames_ab  bytes_ab_val  bytes_ab_unit
-    r"\d+\s+[\d.]+\s+\S+\s+"         # total (skip)
-    r"([\d.]+)\s+"                    # rel_start
-    r"([\d.]+)"                       # duration
-)
-
-
-def _parse_tshark_bytes(value: str, unit: str) -> int:
-    """Convert tshark human-readable size (e.g. '85 kB') to integer bytes."""
-    try:
-        n = float(value)
-        u = unit.lower()
-        if u in ("kb", "kib"):
-            return int(n * 1024)
-        if u in ("mb", "mib"):
-            return int(n * 1024 * 1024)
-        if u in ("gb", "gib"):
-            return int(n * 1024 * 1024 * 1024)
-        return int(n)
-    except (ValueError, TypeError):
-        return 0
-
-_BATCH_PASS2_FIELDS = [
-    "frame.time_epoch", "ip.src", "ip.dst", "ip.proto",
-    "tcp.srcport", "tcp.dstport", "udp.srcport", "udp.dstport",
-    "dns.qry.name", "dns.qry.type", "dns.qry.class", "dns.flags.rcode",
-    "dns.flags.authoritative", "dns.flags.recdesired", "dns.flags.recavail",
-    "http.request.method", "http.request.full_uri", "http.user_agent",
-    "http.response.code", "http.content_length",
-    "http.referer", "http.request.version", "http.content_type",
-    "ssl.handshake.version", "ssl.handshake.ciphersuite",
-]
-
-_BATCH_WINDOW_SECONDS = 15
-
-_BATCH_PROTO_MAP = {
-    "1": "ICMP", "6": "TCP", "17": "UDP",
-    "47": "GRE", "50": "ESP", "51": "AH", "58": "ICMPV6", "132": "SCTP",
-}
-_BATCH_SERVICE_PORTS = {
-    20: "ftp", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp",
-    53: "dns", 67: "dhcp", 68: "dhcp", 80: "http", 110: "pop3",
-    123: "ntp", 143: "imap", 443: "https", 445: "smb", 3389: "rdp",
-}
-
-
-class _BatchCaptureAgent:
-    """Runs tshark in ring-buffer mode and processes completed pcaps in-process."""
-
-    def __init__(self) -> None:
-        self._proc: subprocess.Popen | None = None
-        self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()
-        self._interface: str | None = None
-        self._tshark_bin: str | None = None
-        self._batch_dir: str | None = None
         self._start_time: float | None = None
         self._batches_processed = 0
+        self._flows_captured = 0
         self._last_batch: datetime | None = None
         self._last_error: str | None = None
         self._stop_evt = threading.Event()
+        self._nfstreamer = None  # NFStreamer ref; set in _run_loop, cleared by _stop_internal
+        self._meter_pids: set = set()
         self.running = False
 
-    def start(self, interface: str, tshark_bin: str) -> None:
-        import shutil as _shutil
-        import tempfile as _tempfile
+    def start(self, interface: str) -> None:
         with self._lock:
             self._stop_internal()
             self._stop_evt.clear()
             self._interface = interface
-            self._tshark_bin = tshark_bin
             self._batches_processed = 0
+            self._flows_captured = 0
             self._last_batch = None
             self._last_error = None
             self._start_time = time.time()
-            self._batch_dir = _tempfile.mkdtemp(prefix="adns_batch_")
             self._thread = threading.Thread(target=self._run_loop, daemon=True)
             self._thread.start()
 
@@ -1212,19 +898,40 @@ class _BatchCaptureAgent:
             self._stop_internal()
 
     def _stop_internal(self) -> None:
-        import shutil as _shutil
         self._stop_evt.set()
         self.running = False
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+        ns, self._nfstreamer = self._nfstreamer, None
+        self._meter_pids.clear()
+        if ns is not None:
+            stopped = False
             try:
-                self._proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-        self._proc = None
-        if self._batch_dir and os.path.isdir(self._batch_dir):
-            _shutil.rmtree(self._batch_dir, ignore_errors=True)
-        self._batch_dir = None
+                if hasattr(ns, "_terminate"):
+                    ns._terminate()
+                    stopped = True
+                elif hasattr(ns, "_meters"):
+                    for m in ns._meters:
+                        try:
+                            if hasattr(m, "terminate"):
+                                m.terminate()
+                        except Exception:
+                            pass
+                    stopped = True
+            except Exception:
+                pass
+            if not stopped:
+                # NFStream version has no public shutdown API.  Terminate all current
+                # child processes — when ADNS_EXTRACTOR=nfstream, the only children
+                # are NFStream's meter workers (tshark agents are inactive).
+                # This unblocks the for-nf-in-streamer iteration in _run_loop.
+                try:
+                    import psutil
+                    for child in psutil.Process().children(recursive=True):
+                        try:
+                            child.terminate()
+                        except psutil.NoSuchProcess:
+                            pass
+                except Exception:
+                    pass
         self._start_time = None
 
     def status(self) -> dict:
@@ -1232,258 +939,81 @@ class _BatchCaptureAgent:
         return {
             "running": self.running,
             "interface": self._interface,
+            "extractor": "nfstream",
             "batches_processed": self._batches_processed,
+            "flows_captured": self._flows_captured,
             "last_batch": self._last_batch.isoformat() if self._last_batch else None,
             "uptime_seconds": uptime,
             "last_error": self._last_error,
         }
 
     def _run_loop(self) -> None:
-        tshark_bin = self._tshark_bin
-        batch_dir = self._batch_dir
         self.running = True
-        seq = 0
+        try:
+            from adns_flows.extract_nfstream import _nf_to_flow
+            from adns_flows.nfstream_config import make_nfstream_kwargs
+            from nfstream import NFStreamer
 
-        while not self._stop_evt.is_set():
-            seq += 1
-            pcap_path = os.path.join(batch_dir, f"cap_{seq:04d}.pcap")
-            cmd = [
-                tshark_bin, "-i", self._interface,
-                "-a", f"duration:{_BATCH_WINDOW_SECONDS}",
-                "-F", "pcap",
-                "-w", pcap_path, "-q",
-            ]
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                    cwd=os.path.dirname(os.path.abspath(tshark_bin)),
-                    env=_tshark_env(tshark_bin),
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                )
-                with self._lock:
-                    self._proc = proc
-            except Exception as exc:
-                self._last_error = str(exc)
-                self.running = False
-                return
+            kwargs = make_nfstream_kwargs(n_meters=1)
+            streamer = NFStreamer(source=self._interface, **kwargs)
+            with self._lock:
+                self._nfstreamer = streamer
 
-            # Poll until tshark finishes the capture window or stop is requested
-            while proc.poll() is None:
-                if self._stop_evt.wait(1.0):
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    self.running = False
-                    return
+            batch: list = []
+            last_flush = time.time()
 
-            stderr_out = ""
-            if proc.stderr:
-                try:
-                    stderr_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
-                except Exception:
-                    pass
-
-            if proc.returncode != 0:
-                detail = f": {stderr_out[:300]}" if stderr_out else ""
-                self._last_error = f"tshark exited code {proc.returncode}{detail}"
-                if self._stop_evt.wait(5.0):
+            for nf in streamer:
+                if self._stop_evt.is_set():
                     break
-                continue
-
-            if os.path.exists(pcap_path):
                 try:
-                    flows = self._process_pcap(pcap_path, tshark_bin)
-                    if flows:
-                        self._ingest(flows)
-                        self._batches_processed += 1
-                        self._last_batch = datetime.utcnow()
+                    adns_flow = _nf_to_flow(nf)
+                    batch.append(adns_flow)
                 except Exception as exc:
-                    self._last_error = str(exc)
-                    app.logger.exception("batch pcap processing failed: %s", exc)
-                finally:
-                    try:
-                        os.unlink(pcap_path)
-                    except OSError:
-                        pass
+                    app.logger.warning("_NfstreamCaptureAgent: flow conversion error: %s", exc)
+                    continue
 
-        self.running = False
+                now = time.time()
+                if len(batch) >= self._BATCH_SIZE or now - last_flush >= self._FLUSH_INTERVAL:
+                    self._ingest(batch)
+                    with self._lock:
+                        self._batches_processed += 1
+                        self._flows_captured += len(batch)
+                        self._last_batch = datetime.utcnow()
+                    batch = []
+                    last_flush = now
 
-    def _process_pcap(self, pcap: str, tshark_bin: str) -> list[dict]:
-        conv_flows = self._run_conv_stats(pcap, tshark_bin)
-        if not conv_flows:
-            return []
-        packets = self._run_field_pass(pcap, tshark_bin)
-        app_index = self._build_app_index(packets)
-        return self._merge_flows(conv_flows, app_index, os.path.getmtime(pcap))
+            if batch and not self._stop_evt.is_set():
+                self._ingest(batch)
+                with self._lock:
+                    self._batches_processed += 1
+                    self._flows_captured += len(batch)
+                    self._last_batch = datetime.utcnow()
 
-    def _run_conv_stats(self, pcap: str, tshark_bin: str) -> list[dict]:
-        try:
-            result = subprocess.run(
-                [tshark_bin, "-r", pcap, "-q", "-z", "conv,tcp", "-z", "conv,udp"],
-                capture_output=True, timeout=60,
-                cwd=os.path.dirname(os.path.abspath(tshark_bin)),
-                env=_tshark_env(tshark_bin),
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
         except Exception as exc:
-            app.logger.warning("conv stats failed: %s", exc)
-            return []
-        flows, current_proto = [], "TCP"
-        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-            if "TCP Conversations" in line:
-                current_proto = "TCP"
-            elif "UDP Conversations" in line:
-                current_proto = "UDP"
-            m = _BATCH_CONV_RE.search(line)
-            if not m:
-                continue
-            (a_ip, a_port, b_ip, b_port,
-             frames_ba, bytes_ba_val, bytes_ba_unit,
-             frames_ab, bytes_ab_val, bytes_ab_unit,
-             rel_start, duration) = m.groups()
-            flows.append({
-                "proto": current_proto,
-                "src_ip": a_ip, "src_port": int(a_port),
-                "dst_ip": b_ip, "dst_port": int(b_port),
-                "src_bytes": _parse_tshark_bytes(bytes_ab_val, bytes_ab_unit),
-                "dst_bytes": _parse_tshark_bytes(bytes_ba_val, bytes_ba_unit),
-                "src_pkts": int(frames_ab), "dst_pkts": int(frames_ba),
-                "duration": float(duration), "rel_start": float(rel_start),
-            })
-        return flows
+            self._last_error = str(exc)
+            app.logger.exception("_NfstreamCaptureAgent run loop failed: %s", exc)
+        finally:
+            with self._lock:
+                self._nfstreamer = None
+            self.running = False
 
-    def _run_field_pass(self, pcap: str, tshark_bin: str) -> list[dict]:
-        cmd = [tshark_bin, "-r", pcap, "-T", "fields", "-Y", "ip"]
-        for field in _BATCH_PASS2_FIELDS:
-            cmd.extend(["-e", field])
-        cmd.extend(["-E", "separator=\t", "-E", "header=n"])
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, timeout=120,
-                cwd=os.path.dirname(os.path.abspath(tshark_bin)),
-                env=_tshark_env(tshark_bin),
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-        except Exception as exc:
-            app.logger.warning("field pass failed: %s", exc)
-            return []
-        n = len(_BATCH_PASS2_FIELDS)
-        packets = []
-        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-            parts = line.split("\t")
-            if len(parts) < n:
-                parts += [""] * (n - len(parts))
-            src_ip, dst_ip = parts[1].strip(), parts[2].strip()
-            if not src_ip or not dst_ip:
-                continue
-            pv = parts[3].strip()
-            proto = _BATCH_PROTO_MAP.get(pv, pv.upper() if pv else "OTHER")
-
-            def _si(v):
-                try: return int(v.strip()) if v.strip() else None
-                except (ValueError, AttributeError): return None
-
-            pkt = {
-                "ts": parts[0].strip(), "src_ip": src_ip, "dst_ip": dst_ip, "proto": proto,
-                "src_port": _si(parts[4]) or _si(parts[6]),
-                "dst_port": _si(parts[5]) or _si(parts[7]),
-            }
-            for key, raw in [
-                ("dns_query", parts[8]), ("dns_qtype", _si(parts[9])),
-                ("dns_qclass", _si(parts[10])), ("dns_rcode", _si(parts[11])),
-                ("dns_AA", _si(parts[12])), ("dns_RD", _si(parts[13])), ("dns_RA", _si(parts[14])),
-                ("http_method", parts[15]), ("http_uri", parts[16]),
-                ("http_user_agent", parts[17]), ("http_status_code", _si(parts[18])),
-                ("http_content_length", _si(parts[19])), ("http_referrer", parts[20]),
-                ("http_version", parts[21]), ("http_content_type", parts[22]),
-                ("ssl_version", _si(parts[23])), ("ssl_cipher", parts[24]),
-            ]:
-                val = raw.strip() if isinstance(raw, str) else raw
-                if val is not None and val != "":
-                    pkt[key] = val
-            packets.append(pkt)
-        return packets
-
-    @staticmethod
-    def _build_app_index(packets: list[dict]) -> dict:
-        index: dict = {}
-        skip = {"ts", "src_ip", "dst_ip", "proto", "src_port", "dst_port"}
-        for pkt in packets:
-            s = (pkt.get("src_ip", ""), pkt.get("src_port") or 0)
-            d = (pkt.get("dst_ip", ""), pkt.get("dst_port") or 0)
-            for key in ((s[0], s[1], d[0], d[1]), (d[0], d[1], s[0], s[1])):
-                if key not in index:
-                    index[key] = {}
-                for k, v in pkt.items():
-                    if k in skip or v is None or v == "":
-                        continue
-                    index[key].setdefault(k, v)
-        return index
-
-    def _merge_flows(self, conv_flows: list[dict], app_index: dict, pcap_mtime: float) -> list[dict]:
-        result = []
-        for flow in conv_flows:
-            key = (flow["src_ip"], flow["src_port"], flow["dst_ip"], flow["dst_port"])
-            app_data = app_index.get(key, {})
-            total_bytes = flow["src_bytes"] + flow["dst_bytes"]
-            rec = {
-                "ts": pcap_mtime - _BATCH_WINDOW_SECONDS + flow["rel_start"],
-                "src_ip": flow["src_ip"], "dst_ip": flow["dst_ip"],
-                "proto": flow["proto"], "bytes": total_bytes,
-                "src_bytes": flow["src_bytes"], "dst_bytes": flow["dst_bytes"],
-                "src_pkts": flow["src_pkts"], "dst_pkts": flow["dst_pkts"],
-                "duration": flow["duration"],
-                "src_port": flow["src_port"], "dst_port": flow["dst_port"],
-            }
-            for k, v in app_data.items():
-                rec.setdefault(k, v)
-            rec["service"] = self._infer_service(
-                flow["proto"], flow["src_port"], flow["dst_port"],
-                app_data.get("dns_query"), app_data.get("http_method"), app_data.get("ssl_version"),
-            )
-            ct = app_data.get("http_content_type", "")
-            if ct:
-                if app_data.get("http_method"):
-                    rec.setdefault("http_orig_mime_types", ct)
-                elif app_data.get("http_status_code"):
-                    rec.setdefault("http_resp_mime_types", ct)
-            dns_rcode = app_data.get("dns_rcode")
-            if dns_rcode is not None:
-                rec.setdefault("dns_rejected", 1 if dns_rcode != 0 else 0)
-            result.append(rec)
-        return result
-
-    @staticmethod
-    def _infer_service(proto, src_port, dst_port, dns_query, http_method, ssl_version) -> str:
-        if http_method:
-            return "http"
-        if ssl_version is not None or dst_port in {443, 8443}:
-            return "https"
-        if dns_query or dst_port == 53:
-            return "dns"
-        port = dst_port or src_port
-        return _BATCH_SERVICE_PORTS.get(port, (proto or "other").lower()) if port else (proto or "other").lower()
-
-    def _ingest(self, flows: list[dict]) -> None:
+    def _ingest(self, adns_flow_list: list) -> None:
+        """Ingest a list of adns_flows.schema.Flow objects into the DB."""
         with app.app_context():
             blocked_set = {r.ip for r in BlockedIP.query.filter_by(active=True).all()}
             flow_records: list[Flow] = []
-            for rec in flows:
-                src_ip = rec.get("src_ip", "")
-                dst_ip = rec.get("dst_ip", "")
-                if src_ip in blocked_set or dst_ip in blocked_set:
+            for af in adns_flow_list:
+                if af.src_ip in blocked_set or af.dst_ip in blocked_set:
                     continue
+                extra = flow_to_extra(af)
                 f = Flow(
-                    timestamp=parse_timestamp(rec.get("ts")),
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    proto=normalize_protocol(rec.get("proto", "")),
-                    bytes=int(rec.get("bytes") or 0),
-                    extra=build_flow_extra(rec),
-                    source="batch",
+                    timestamp=datetime.fromtimestamp(af.ts, tz=timezone.utc),
+                    src_ip=af.src_ip,
+                    dst_ip=af.dst_ip,
+                    proto=normalize_protocol(str(af.proto)),
+                    bytes=int(extra.get("total_bytes", 0)),
+                    extra=extra,
+                    source="nfstream",
                 )
                 flow_records.append(f)
                 db.session.add(f)
@@ -1492,14 +1022,14 @@ class _BatchCaptureAgent:
                     db.session.flush()
                     flow_ids = [f.id for f in flow_records]
                     db.session.commit()
-                    enforce_batch_flow_retention()
+                    enforce_flow_retention()
                     enqueue_flow_scoring(flow_ids)
                 except Exception as exc:
                     db.session.rollback()
-                    app.logger.exception("batch ingest failed: %s", exc)
+                    app.logger.exception("nfstream ingest failed: %s", exc)
 
 
-_batch_capture_agent = _BatchCaptureAgent()
+_nfstream_capture_agent = _NfstreamCaptureAgent()
 
 # Module-level record of the auto-detected interface (set by /capture/autostart)
 _detected_interface: dict | None = None
@@ -1724,19 +1254,13 @@ def simulate_attack():
                             db.session.add(flow)
                         db.session.flush()
 
-                        for flow in flows:
-                            pred = simulation_detector.predict(db.session, flow)
-                            if isinstance(pred, (list, tuple)) and len(pred) == 3:
-                                score, label, attack_label = pred
-                            else:
-                                score, label = pred
-                                attack_label = None
-                            base_labels = {"normal", "watch", "anomaly"}
+                        preds = _simulation_scorer.score_many(flows)
+                        base_labels = {"normal", "watch", "anomaly"}
+                        for flow, pred in zip(flows, preds):
+                            score, label = pred
                             candidate_attack = None
                             if label and label.lower() not in base_labels:
                                 candidate_attack = label
-                            elif attack_label and label and label.lower() != "normal":
-                                candidate_attack = attack_label
                             elif label and label.lower() in {"normal", "watch"}:
                                 candidate_attack = _infer_scanning(flow)
                             extras = dict(flow.extra or {})
@@ -1786,20 +1310,14 @@ def simulate_attack():
     db.session.flush()
 
     scores: list[float] = []
-    for flow in flows:
-        pred = simulation_detector.predict(db.session, flow)
-        if isinstance(pred, (list, tuple)) and len(pred) == 3:
-            score, label, attack_label = pred
-        else:
-            score, label = pred
-            attack_label = None
+    preds = _simulation_scorer.score_many(flows)
+    base_labels = {"normal", "watch", "anomaly"}
+    for flow, pred in zip(flows, preds):
+        score, label = pred
         scores.append(score)
-        base_labels = {"normal", "watch", "anomaly"}
         candidate_attack = None
         if label and label.lower() not in base_labels:
             candidate_attack = label
-        elif attack_label and label and label.lower() != "normal":
-            candidate_attack = attack_label
         elif label and label.lower() in {"normal", "watch"}:
             candidate_attack = _infer_scanning(flow)
         extras = dict(flow.extra or {})
@@ -2047,27 +1565,25 @@ def list_interfaces():
 
 @app.get("/agent/status")
 def agent_status():
-    return jsonify(_capture_agent.status())
+    return jsonify(_nfstream_capture_agent.status())
 
 
 @app.get("/capture_status")
 def capture_status():
-    tshark = _find_tshark()
     return jsonify({
         "version": _APP_VERSION,
         "interface": _detected_interface,
-        "tshark_found": tshark is not None,
-        "live": _capture_agent.status(),
-        "batch": _batch_capture_agent.status(),
+        "extractor": "nfstream",
+        "nfstream": _nfstream_capture_agent.status(),
     })
 
 
 @app.get("/model_status")
 def model_status():
-    """Probe each ML estimator in the meta-model bundle and report health."""
-    test_X = np.zeros((1, len(MetaFeatureBuilder.FEATURE_COLUMNS)), dtype="float32")
-
-    if simulation_detector.model is None:
+    """Probe the NFStream ML model bundle and report health."""
+    from adns_flows.schema import FEATURE_COLUMNS
+    scorer = _simulation_scorer._scorer
+    if scorer is None:
         return jsonify({
             "meta_model_status": "absent",
             "active_estimators": 0,
@@ -2075,17 +1591,16 @@ def model_status():
             "estimators": {},
         })
 
+    test_X = np.zeros((1, len(FEATURE_COLUMNS)), dtype="float32")
     estimators: dict = {}
     active = 0
 
-    for name, model in simulation_detector.model.models.items():
-        n_feat = getattr(model, "n_features_in_", test_X.shape[1])
-        X = simulation_detector.model._match_shape(test_X, n_feat)
+    for name, model in scorer.models.items():
         ok = False
         err_msg: str | None = None
         for method in ("predict_proba", "predict"):
             try:
-                getattr(model, method)(X)
+                getattr(model, method)(test_X)
                 ok = True
                 break
             except Exception as exc:
@@ -2094,14 +1609,8 @@ def model_status():
             active += 1
         estimators[name] = {"status": "ok" if ok else "broken", "error": None if ok else err_msg}
 
-    total = len(simulation_detector.model.models)
-    if active == total:
-        overall = "ok"
-    elif active > 0:
-        overall = "degraded"
-    else:
-        overall = "broken"
-
+    total = len(scorer.models)
+    overall = "ok" if active == total else ("degraded" if active > 0 else "broken")
     return jsonify({
         "meta_model_status": overall,
         "active_estimators": active,
@@ -2113,22 +1622,15 @@ def model_status():
 @app.post("/capture/autostart")
 def capture_autostart():
     global _detected_interface
-    tshark = _find_tshark()
-    if not tshark:
-        return jsonify({"error": "tshark not found"}), 503
     iface = _auto_detect_interface()
     if not iface:
         return jsonify({"error": "no suitable network interface detected"}), 503
     _detected_interface = iface
     try:
-        _capture_agent.start(iface["device"], tshark)
+        _nfstream_capture_agent.start(iface["device"])
     except Exception as exc:
-        app.logger.warning("live capture failed to start: %s", exc)
-    try:
-        _batch_capture_agent.start(iface["device"], tshark)
-    except Exception as exc:
-        app.logger.warning("batch capture failed to start: %s", exc)
-    return jsonify({"status": "ok", "interface": iface})
+        app.logger.warning("nfstream capture failed to start: %s", exc)
+    return jsonify({"status": "ok", "interface": iface, "extractor": "nfstream"})
 
 
 # ---------------------------------------------------------------

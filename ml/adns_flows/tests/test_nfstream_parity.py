@@ -80,12 +80,8 @@ import pytest
 # Skip entire module if nfstream is not installed.
 nfstream = pytest.importorskip("nfstream")
 
-from adns_flows.extract import find_tshark
 from adns_flows.extract_nfstream import extract_flows_nfstream, flows_to_dataframe_nfstream
 from adns_flows.schema import FEATURE_COLUMNS, IDENTITY_COLUMNS
-
-_TSHARK = find_tshark()
-tshark_only = pytest.mark.skipif(_TSHARK is None, reason="tshark binary not available")
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -247,43 +243,3 @@ def test_dataframe_schema_valid(fixture_pcap_path):
     assert list(df.columns) == expected_cols
 
 
-# ── Step 4.1b: Cross-extractor flag parity (requires tshark) ─────────────────
-
-@tshark_only
-def test_flag_counts_match_tshark(fixture_pcap_path):
-    """Flag counts from NFStream and tshark must be identical for the same pcap.
-
-    Bucket A (must match): syn/ack/rst/fin/psh/urg counts.
-    Bucket B (expected diff): byte counts differ by 14 bytes/packet (L2 vs L3).
-    """
-    from adns_flows.assemble import extract_flows
-
-    nf_flows = extract_flows_nfstream(str(fixture_pcap_path))
-    ts_flows = extract_flows(_TSHARK, pcap=str(fixture_pcap_path))
-
-    # Key both flow lists by canonical (src_ip, src_port, dst_ip, dst_port)
-    def _key(f):
-        return (f.src_ip, f.src_port, f.dst_ip, f.dst_port)
-
-    nf_map = {_key(f): f for f in nf_flows}
-    ts_map = {_key(f): f for f in ts_flows}
-
-    assert set(nf_map) == set(ts_map), (
-        f"Flow keys differ:\n  nfstream={sorted(nf_map)}\n  tshark={sorted(ts_map)}"
-    )
-
-    for key in nf_map:
-        nf = nf_map[key]
-        ts = ts_map[key]
-        label = f"{key[0]}:{key[1]}→{key[2]}:{key[3]}"
-        assert nf.syn_count == ts.syn_count, f"{label} syn: nf={nf.syn_count} ts={ts.syn_count}"
-        assert nf.ack_count == ts.ack_count, f"{label} ack: nf={nf.ack_count} ts={ts.ack_count}"
-        assert nf.rst_count == ts.rst_count, f"{label} rst: nf={nf.rst_count} ts={ts.rst_count}"
-        assert nf.fin_count == ts.fin_count, f"{label} fin: nf={nf.fin_count} ts={ts.fin_count}"
-        assert nf.psh_count == ts.psh_count, f"{label} psh: nf={nf.psh_count} ts={ts.psh_count}"
-        assert nf.urg_count == ts.urg_count, f"{label} urg: nf={nf.urg_count} ts={ts.urg_count}"
-        # Both extractors count Ethernet frame bytes (L2) — values must be equal.
-        assert nf.src_bytes == ts.src_bytes, f"{label} src_bytes: nf={nf.src_bytes} ts={ts.src_bytes}"
-        assert nf.dst_bytes == ts.dst_bytes, f"{label} dst_bytes: nf={nf.dst_bytes} ts={ts.dst_bytes}"
-        assert nf.src_pkts  == ts.src_pkts,  f"{label} src_pkts:  nf={nf.src_pkts} ts={ts.src_pkts}"
-        assert nf.dst_pkts  == ts.dst_pkts,  f"{label} dst_pkts:  nf={nf.dst_pkts} ts={ts.dst_pkts}"

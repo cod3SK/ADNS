@@ -5,9 +5,9 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-day1 = Path(r"X:\ADNS\outputs\corpus\unsw_day1_nfstream.parquet")
-day2 = Path(r"X:\ADNS\outputs\corpus\unsw_day2_nfstream.parquet")
-out  = Path(r"X:\ADNS\outputs\corpus\unsw_flows_nfstream.parquet")
+day1 = Path(r"X:\ADNS\outputs\corpus\unsw_day1.parquet")
+day2 = Path(r"X:\ADNS\outputs\corpus\unsw_day2.parquet")
+out  = Path(r"X:\ADNS\outputs\corpus\unsw_flows.parquet")
 
 if not day1.exists():
     raise FileNotFoundError(f"Missing: {day1}")

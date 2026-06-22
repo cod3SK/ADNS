@@ -12,11 +12,11 @@ except ImportError:  # postgresql dialect not bundled (e.g. PyInstaller SQLite-o
 from sqlalchemy.exc import IntegrityError
 
 from app import Flow, Prediction, app, db
-from model_runner import DetectionEngine
+from model_runner import NfstreamDetectionEngine
 from rdns import ReverseDNSResolver
 
 logger = logging.getLogger(__name__)
-detector = DetectionEngine()
+nfstream_detector = NfstreamDetectionEngine()
 
 SCORING_FETCH_CHUNK = int(os.environ.get("ADNS_SCORING_FETCH_CHUNK", "256"))
 RDNS_ENABLED = os.environ.get("ADNS_RDNS_ENABLED", "true").lower() not in {"0", "false", "no"}
@@ -104,7 +104,6 @@ def score_flow_batch(flow_ids: Sequence[int]) -> int:
         if not ids:
             return 0
 
-        detector.reload_if_stale()
         scored = 0
         session = db.session
 
@@ -123,8 +122,9 @@ def score_flow_batch(flow_ids: Sequence[int]) -> int:
                 if RDNS_ENABLED:
                     _enrich_with_rdns(flows_to_score)
 
-                predictions = detector.predict_many(session, flows_to_score)
-                if len(predictions) != len(flows):
+                predictions: list = nfstream_detector.score_many(flows_to_score)
+
+                if len(predictions) != len(flows_to_score):
                     raise RuntimeError("detection engine returned mismatched prediction count")
                 now = datetime.now(timezone.utc)
                 records = []
