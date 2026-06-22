@@ -45,7 +45,9 @@ a = Analysis(
     datas=[
         # React production build
         ("frontend/adns-frontend/dist", "dist"),
-        # Trained model artifacts (included if present; app degrades gracefully without them)
+        # Trained model artifacts — REQUIRED for detection.  Absent model blocks
+        # /capture/autostart with HTTP 503 (not silent).  See api/model_runner.py.
+        # nfstream_model.joblib is tracked via Git LFS; run `git lfs pull` after clone.
         ("api/model_artifacts", "model_artifacts"),
         # Flask app source files (all modules in api/)
         ("api/*.py", "api"),

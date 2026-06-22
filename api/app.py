@@ -1622,6 +1622,15 @@ def model_status():
 @app.post("/capture/autostart")
 def capture_autostart():
     global _detected_interface
+    # Live capture with no model = silent zero-detection: block it loudly.
+    if not _simulation_scorer.is_model_loaded:
+        return jsonify({
+            "error": (
+                "live capture blocked: NFStream model not loaded. "
+                f"Detail: {_simulation_scorer.model_error}. "
+                "Run ml/train_nfstream.py to produce api/model_artifacts/nfstream_model.joblib."
+            )
+        }), 503
     iface = _auto_detect_interface()
     if not iface:
         return jsonify({"error": "no suitable network interface detected"}), 503

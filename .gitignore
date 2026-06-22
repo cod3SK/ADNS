@@ -15,8 +15,7 @@ api/instance/
 dist/
 build/
 
-# Model artifacts (large binary files — ship via release or local build)
-api/model_artifacts/*.joblib
+# Model artifacts are tracked via Git LFS (.gitattributes), not ignored.
 
 # Frontend build
 frontend/adns-frontend/dist/

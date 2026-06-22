@@ -139,6 +139,31 @@ unsw|gotham|cic`.
 
 Tshark-era parquets archived to `outputs/corpus/archive/` (not deleted).
 
+**Model artifact versioning:**
+`api/model_artifacts/nfstream_model.joblib` (102 MB) is stored in Git LFS.
+After cloning: `git lfs pull` fetches it. Absent model blocks `/capture/autostart`
+with HTTP 503 — not a silent failure (see `api/model_runner.py:NfstreamDetectionEngine`).
+
+**Reproducible rebuild path** (raw PCAPs required — local to original dev machine):
+```
+# Raw PCAPs assumed present at the paths below.
+# UNSW-NB15 (two collection days):
+python ml/run_unsw_day1_nfstream.py   # X:\DATA\UNSW\pcap files\pcaps 22-1-2015\ → outputs/corpus/unsw_day1.parquet
+python ml/run_unsw_day2_nfstream.py   # X:\DATA\UNSW\pcap files\pcaps 17-2-2015\ → outputs/corpus/unsw_day2.parquet
+python ml/combine_unsw_nfstream.py    # merges day1+day2  → outputs/corpus/unsw_flows.parquet
+
+# Gotham Dataset 2025:
+python -m corpus.build_corpus gotham  # X:\DATA\Gotham2025\        → outputs/corpus/gotham_flows.parquet
+
+# CIC-IDS2017 Tuesday:
+python -m corpus.build_corpus cic     # X:\DATA\CICIDS2017\Tuesday-WorkingHours.pcap → outputs/corpus/cic_tuesday_flows.parquet
+
+# Train E3 pooled model (reads all three parquets above):
+python ml/train_nfstream.py           # → api/model_artifacts/nfstream_model.joblib
+```
+Corpus parquets (~120 MB total) are NOT in git (no LFS for them — too large and
+reproducible from raw PCAPs). The raw PCAPs are ~15 GB total and are not redistributable.
+
 **Dataset-specific label quirks:**
 
 *UNSW-NB15:* Ground-truth CSV at `X:\DATA\UNSW\CSV Files\NUSW-NB15_GT.csv`

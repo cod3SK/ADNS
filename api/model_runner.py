@@ -20,21 +20,39 @@ class NfstreamDetectionEngine:
 
     Returns (0.0, 'normal') for any flow whose extra does not carry the
     '_extractor': 'nfstream' marker (pre-Phase-3 flows, or extraction failures).
+
+    If the model artifact is absent or fails to load, `is_model_loaded` is False and
+    `model_error` carries the reason.  Live capture is blocked by /capture/autostart
+    until the model is present — see api/app.py.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model_path: "str | Path | None" = None) -> None:
         self._scorer = None
-        self._load()
+        self._model_error: str | None = None
+        self._load(model_path)
 
-    def _load(self) -> None:
+    def _load(self, model_path: "str | Path | None" = None) -> None:
         try:
             from serving_nfstream import NfstreamScorer
-            self._scorer = NfstreamScorer()
+            self._scorer = NfstreamScorer(model_path)
             logger.info("NfstreamDetectionEngine: model loaded")
-        except FileNotFoundError:
-            logger.info("NfstreamDetectionEngine: model artifact absent, scoring disabled")
+        except FileNotFoundError as exc:
+            self._model_error = str(exc)
+            logger.error(
+                "NFStream model not found — live capture and batch scoring will be blocked: %s",
+                exc,
+            )
         except Exception as exc:
-            logger.warning("NfstreamDetectionEngine: failed to load: %s", exc)
+            self._model_error = str(exc)
+            logger.error("NfstreamDetectionEngine: failed to load model: %s", exc)
+
+    @property
+    def is_model_loaded(self) -> bool:
+        return self._scorer is not None
+
+    @property
+    def model_error(self) -> "str | None":
+        return self._model_error
 
     def score_many(self, flows: Sequence) -> list[Tuple[float, str]]:
         """Score a batch of DB Flow objects using contract features from flow.extra."""
