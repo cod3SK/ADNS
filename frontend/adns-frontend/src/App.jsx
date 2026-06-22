@@ -879,50 +879,38 @@ export default function App() {
                     </span>
                   </div>
                   <div className="pipeline-row">
-                    <span className="pipeline-label">tshark</span>
-                    <span className={`status-dot ${captureStatus?.tshark_found ? "dot-ok" : "dot-err"}`} />
-                    <span className="pipeline-value">
-                      {captureStatus == null ? "…" : captureStatus.tshark_found ? "Found" : "Not installed"}
-                    </span>
+                    <span className="pipeline-label">Extractor</span>
+                    <span className="status-dot dot-ok" />
+                    <span className="pipeline-value">NFStream</span>
                   </div>
 
                   <div className="pipeline-row" style={{marginTop: 6}}>
-                    <span className="pipeline-label">Live</span>
-                    <span className={`status-dot ${captureStatus?.live?.running ? "dot-ok" : "dot-idle"}`} />
+                    <span className="pipeline-label">Capture</span>
+                    <span className={`status-dot ${captureStatus?.nfstream?.running ? "dot-ok" : "dot-idle"}`} />
                     <span className="pipeline-value">
-                      {captureStatus?.live?.running
-                        ? `Running · ${(captureStatus.live.flows_captured ?? 0).toLocaleString()} flows`
-                        : "Stopped"}
+                      {captureStatus == null ? "…"
+                        : captureStatus.nfstream?.running
+                          ? `Running · ${(captureStatus.nfstream.flows_captured ?? 0).toLocaleString()} flows`
+                          : "Stopped"}
                     </span>
                   </div>
-                  {captureStatus?.live?.running && captureStatus.live.last_ingest && (
+                  {captureStatus?.nfstream?.running && captureStatus.nfstream.last_batch && (
                     <div className="pipeline-row">
-                      <span className="pipeline-label">Last packet</span>
-                      <span className="pipeline-value">{formatRelativeTime(captureStatus.live.last_ingest)}</span>
+                      <span className="pipeline-label">Last flow</span>
+                      <span className="pipeline-value">{formatRelativeTime(captureStatus.nfstream.last_batch)}</span>
+                    </div>
+                  )}
+                  {captureStatus?.nfstream?.running && (captureStatus.nfstream.batches_processed ?? 0) > 0 && (
+                    <div className="pipeline-row">
+                      <span className="pipeline-label">Ingested</span>
+                      <span className="pipeline-value">
+                        {(captureStatus.nfstream.batches_processed).toLocaleString()} batches
+                      </span>
                     </div>
                   )}
 
-                  <div className="pipeline-row" style={{marginTop: 6}}>
-                    <span className="pipeline-label">Batch</span>
-                    <span className={`status-dot ${captureStatus?.batch?.running ? "dot-ok" : "dot-idle"}`} />
-                    <span className="pipeline-value">
-                      {captureStatus?.batch?.running
-                        ? `Running · ${captureStatus.batch.batches_processed ?? 0} batches`
-                        : "Stopped"}
-                    </span>
-                  </div>
-                  {captureStatus?.batch?.running && captureStatus.batch.last_batch && (
-                    <div className="pipeline-row">
-                      <span className="pipeline-label">Last batch</span>
-                      <span className="pipeline-value">{formatRelativeTime(captureStatus.batch.last_batch)}</span>
-                    </div>
-                  )}
-
-                  {captureStatus?.live?.last_error && (
-                    <p className="pipeline-error">Live: {captureStatus.live.last_error}</p>
-                  )}
-                  {captureStatus?.batch?.last_error && (
-                    <p className="pipeline-error">Batch: {captureStatus.batch.last_error}</p>
+                  {captureStatus?.nfstream?.last_error && (
+                    <p className="pipeline-error">{captureStatus.nfstream.last_error}</p>
                   )}
                 </div>
               </section>
