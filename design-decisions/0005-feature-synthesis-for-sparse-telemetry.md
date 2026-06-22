@@ -1,6 +1,6 @@
 # 0005 — Feature synthesis and hashing for sparse live telemetry
 
-- **Status:** Accepted
+- **Status:** Superseded — see amendment below
 - **Phase:** 0 — Foundational architecture
 
 ## Context
@@ -41,3 +41,29 @@ width so version skew between artifact and code does not crash inference.
 - `_match_shape` trades a hard failure for a silent one: a genuine feature mismatch
   is masked by padding/truncation rather than surfaced. Acceptable for a resilient
   demo; it would need stricter feature contracts before production use.
+
+## Amendment — replaced by NFStream contract (NFStream migration)
+
+`MetaFeatureBuilder` and `_match_shape` have been deleted from `api/model_runner.py`.
+The problem they were designed to solve — train/serve skew from unobservable features
+— is solved by redesigning what the model is trained on instead of patching at serve time.
+
+**Current approach: the feature contract.**
+
+`ml/adns_flows/schema.py` defines 21 `FEATURE_COLUMNS`, each observable by a
+passive flow observer at serve time (directional byte/packet counts, TCP flag counts,
+rate features, port bucket). No column requires application-layer dissection,
+DNS/HTTP/SSL fields, or `conn_state`.
+
+`ml/adns_flows/extract_nfstream.py` extracts these 21 features identically for:
+- Corpus building (`flows_to_dataframe_nfstream()`)
+- Live scoring (`flow_to_extra()` stores values in `flow.extra`)
+
+`validate_matrix(data, columns)` is called before every `model.predict()`. It raises
+`SchemaError` on any column name or order mismatch — an explicit, loud replacement
+for `_match_shape`'s silent zero-pad.
+
+**Train/serve skew: eliminated by construction.** The corpus extractor and the live
+serving path import from the same `ml/adns_flows/` module. Tests in
+`ml/adns_flows/tests/test_live_equals_training_nfstream.py` (8 tests) prove
+byte-identical feature matrices from the same pcap via both paths.

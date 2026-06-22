@@ -5,8 +5,8 @@
 
 ## Context
 
-Runtime behavior across ADNS — database connection, Redis URL, queue/retention
-tuning, reverse-DNS knobs — is already environment-driven, which is good. But the
+Runtime behavior across ADNS — database connection, queue/retention tuning,
+reverse-DNS knobs — is already environment-driven, which is good. But the
 PostgreSQL credentials were **hard-coded** in `docker-compose.yml` and in the
 default DSN (`adns:adns_password`). Committed credentials are a classic "doesn't
 understand security hygiene" signal and a real risk if a deployment ever reuses

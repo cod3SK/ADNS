@@ -14,29 +14,39 @@ unlikely to run in CI on every push.
 
 ## Decision
 
-Test against the system's own graceful-degradation paths instead of its heavy
-dependencies:
+Test against real dependencies where practical; isolate only what is unavoidable:
 
 - Run the Flask app against a throwaway **SQLite** database.
-- Force the **heuristic** detection tier by pointing the model-artifact paths at
-  non-existent files, so no xgboost/sklearn/joblib model load is needed.
-- Disable reverse-DNS and host `nsenter` in the test environment.
+- The **real NFStream model** (`nfstream_model.joblib`) is loaded by default in
+  the API test suite — it is present via Git LFS. Tests that require an absent
+  model monkeypatch `app._simulation_scorer` with a fresh engine pointing at a
+  nonexistent path (`tmp_path / "no_model.joblib"`).
 - Scoring runs via the in-process `ThreadPoolExecutor` (Redis/RQ was removed — see
   [0002](0002-async-scoring-redis-rq.md)); no queue service is required.
 
-The suite (`api/tests/`) covers endpoints, payload validation, the admin-token
-gate, simulation, blocked-IP filtering, the heuristic scorer, and the meta feature
-builder. A `requirements-test.txt` pins only the lightweight deps. GitHub Actions
-(`.github/workflows/ci.yml`) runs the API tests and the frontend lint/build on
-every push and pull request.
+**ML suite** (`ml/adns_flows/tests/`, 131 tests) covers:
+- Feature contract: column identity, ordering, `validate_matrix()` pass/fail
+- Orientation: canonical src/dst assignment invariants
+- Extractor parity: NFStream corpus path vs NFStream serving path produce
+  byte-identical feature matrices on the same pcap
+- Grain-parity: direct live capture vs windowed path grain comparison
+- Corpus labeling: UNSW, Gotham, CIC label helpers (46 tests)
+
+**API suite** (`api/tests/`, 10 tests):
+- Absent-model loud-failure: ERROR log, `is_model_loaded=False`, HTTP 503 on
+  `/capture/autostart`, `/model_status` reports `"absent"`
+
+**Total: 141 tests.** Run with: `python -m pytest api/tests/ ml/ -q`
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the full suite and frontend
+lint/build on every push.
 
 ## Consequences
 
-- The full suite runs in seconds with no external services, so CI is fast and
-  reliable and the README can carry a live build badge.
-- The tests double as executable documentation of the degradation paths from
-  [0002](0002-async-scoring-redis-rq.md) and [0003](0003-three-tier-detection-cascade.md).
-- Coverage gap (acknowledged): the trained models, the Redis/RQ worker, and the
-  `tshark` agent are not exercised end-to-end. Those would need integration tests
-  with real services (e.g. Compose-based or `testcontainers`) and are out of scope
-  for the unit suite.
+- The full suite runs without external services (no Docker, no Postgres, no
+  tshark, no Redis).
+- Tests cover the real model path (not a heuristic fallback), so regressions in
+  feature extraction or model loading are caught directly.
+- Coverage gap (acknowledged): the frozen exe, live NFStream capture on a real
+  interface, and the installer are exercised by the manual smoke test
+  (`step4_smoke_test.py`), not the unit suite.

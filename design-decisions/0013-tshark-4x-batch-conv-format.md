@@ -1,6 +1,6 @@
 # 0013 — tshark 4.x batch conv output format compatibility
 
-- **Status:** Accepted
+- **Status:** Superseded — tshark removed from the live capture path (NFStream migration)
 - **Phase:** 3 — Desktop packaging and distribution
 
 ## Context
@@ -62,3 +62,16 @@ The `(\S+):(\d+)` address pattern handles both IPv4 (`10.18.0.20:54617`) and IPv
 - Byte values from human-readable units are approximate at the `kB`/`MB` scale
   (nearest integer after multiplying by 1024). The precision is more than
   sufficient for anomaly scoring, which uses total byte volume as a coarse feature.
+
+## Superseded note
+
+The `_BatchCaptureAgent` and all tshark two-pass extraction code have been deleted
+from `api/app.py` as part of the NFStream migration (Phase 6). The `_BATCH_CONV_RE`
+regex and `_parse_tshark_bytes()` helper no longer exist.
+
+Live capture now uses `_NfstreamCaptureAgent`, which streams flows directly via
+NFStream on the network interface — no pcap ring-buffer, no tshark invocation, no
+conv regex. The batch `batches_processed` counter in `/capture_status` now counts
+NFStream flow batches, not tshark pcap windows.
+
+This ADR is retained for historical context only.

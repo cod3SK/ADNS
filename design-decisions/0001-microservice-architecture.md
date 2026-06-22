@@ -50,7 +50,7 @@ self-contained Windows installer built with PyInstaller + Inno Setup (see
 [0010](0010-windows-desktop-packaging.md)). In that mode the "microservices" are
 co-located inside one process: Flask serves both the API and the bundled React
 `dist/`, the thread-pool scorer runs in-process, and packet capture is handled by
-the bundled `tshark` binary launched as a child process.
+NFStream capturing directly from the network interface (no external process).
 
 The service decomposition still holds conceptually — the code paths are the same —
 but the deployment topology reduces to a single executable with no external

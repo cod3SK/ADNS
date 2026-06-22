@@ -1,6 +1,6 @@
 # 0003 — Three-tier detection cascade with hot reload
 
-- **Status:** Accepted
+- **Status:** Superseded — see amendment below
 - **Phase:** 0 — Foundational architecture
 
 ## Context
@@ -43,3 +43,32 @@ a file changes, so new artifacts are picked up live.
   the documented `flow_detector` metrics describe the *fallback* model, not
   necessarily the one serving in a full deployment. See
   [`../ml/model_card.md`](../ml/model_card.md).
+
+## Amendment — replaced by NfstreamDetectionEngine (NFStream migration)
+
+The three-tier cascade (`meta` → `ml` → `heuristic`) has been removed. All three
+prior model classes (`MetaEnsembleModel`, `DetectionEngine`, `FlowScorer`) are
+deleted from `api/model_runner.py`.
+
+**Current detection path:**
+
+`NfstreamDetectionEngine` is the sole scorer. It:
+1. Loads `api/model_artifacts/nfstream_model.joblib` (XGBoost + ExtraTrees E3
+   pooled, trained on 21 contract features).
+2. Calls `NfstreamScorer.score_matrix(X)` which gates every call with
+   `validate_matrix()` — raises `SchemaError` on column mismatch (replaces silent
+   `_match_shape` padding).
+3. Returns `(0.0, "normal")` for any flow whose `extra` does not carry the
+   `_extractor: nfstream` marker (pre-migration flows, extraction failures).
+
+**Absent model behavior** (replaces graceful degradation to heuristic):
+- `is_model_loaded` is `False`; `model_error` carries the reason.
+- `NfstreamDetectionEngine.__init__` logs at `ERROR` level.
+- `/capture/autostart` returns HTTP 503 — no silent no-scoring.
+
+**Hot reload removed.** The mtime-based `reload_if_stale()` mechanism is gone.
+Model reloads require a process restart.
+
+**Test coverage:** `api/tests/test_absent_model.py` (10 tests) covers the
+absent-model loud-failure path. `ml/adns_flows/tests/` (131 tests) covers the
+feature contract, orientation, and grain-parity invariants.

@@ -14,7 +14,7 @@ reacting to recognizable threat patterns on demand.
 
 A `POST /simulate` endpoint synthesizes labeled attack traffic for five
 scenarios — `attack`, `scanning`, `dos`, `ddos`, `injection` — scores flows
-through the live `DetectionEngine`, and persists predictions. Two modes: a
+through the live `NfstreamDetectionEngine`, and persists predictions. Two modes: a
 one-shot `count` batch, and a background streaming mode (`duration_seconds` /
 `interval_seconds`). Inputs are clamped (count 5–250, duration ≤ 600s).
 
@@ -38,3 +38,18 @@ are also released with `db.session.expunge_all()` after each batch.
   capture agent, so the demo reflects actual model behavior.
 - Cost: losing the one-click UI adds a terminal step for demos. Trade-off
   accepted: the dashboard is cleaner and the OOM risk is gone.
+
+## Known limitation — simulate scores 0.0 post-NFStream-migration
+
+The `generate_attack_flows()` function in `api/app.py` generates synthetic `Flow`
+objects whose `extra` dict uses a simplified format (no `_extractor: nfstream`
+marker and no 21-column NFStream feature contract). `extra_to_feature_vector()`
+returns `None` for these flows, causing `score_many()` to return `(0.0, "normal")`
+for all simulated flows.
+
+Real live-captured flows (scored by `_NfstreamCaptureAgent`) carry the full
+21-column contract and score correctly.
+
+Fix path: update `generate_attack_flows()` to emit flows with realistic NFStream
+contract features (all 21 `FEATURE_COLUMNS` populated in `flow.extra`, with
+`_extractor: "nfstream"`).

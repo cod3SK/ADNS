@@ -1,10 +1,8 @@
-# Model Card — ADNS Detectors
+# Model Card — ADNS NFStream Detector
 
-ADNS ships two trained detectors plus a rule-based fallback, selected at runtime
-by the cascade described in
-[ADR-0003](../design-decisions/0003-three-tier-detection-cascade.md). This card
-documents what they are, how they were trained, how they perform, and — just as
-importantly — where they should *not* be trusted.
+ADNS ships one trained detector: `api/model_artifacts/nfstream_model.joblib`. This
+card documents what it is, how it was trained, how it performs, and where it should
+not be trusted.
 
 > **Intended use:** an educational/demonstration anomaly-detection platform for
 > coursework, workshops, and portfolio review. **Not** intended as a production
@@ -13,100 +11,108 @@ importantly — where they should *not* be trusted.
 
 ---
 
-## 1. Meta ensemble — `meta_model_combined.joblib` (primary)
+## 1. Model — `nfstream_model.joblib`
 
 | | |
 | --- | --- |
-| **Type** | Soft-voting ensemble: `ExtraTreesClassifier` + `XGBClassifier` |
-| **Trainer** | `ml/meta/meta_train.py` |
-| **Training data** | Merged Zeek/TON_IoT-style flow dataset (`merged_train.csv` / `merged_test.csv`), cleaned by `ml/preprocess/merge_and_clean.py` |
-| **Features** | ~46 columns: directional bytes/packets, connection state, DNS/HTTP/SSL/`weird` fields, plus reverse-DNS signals |
-| **Selected at runtime** | First — used whenever the artifact and xgboost are present |
+| **Type** | Soft-voting ensemble: `XGBClassifier` + `ExtraTreesClassifier` |
+| **Trainer** | `ml/train_nfstream.py` |
+| **Training data** | E3 pooled corpus: UNSW-NB15 + Gotham Dataset 2025 + CIC-IDS2017 Tuesday (4,698,466 flows total) |
+| **Features** | 21 `FEATURE_COLUMNS` from `ml/adns_flows/schema.py` |
+| **Target** | Binary: 0 = normal, 1 = attack |
+| **Artifact size** | ~102 MB; tracked via Git LFS |
+| **Schema gate** | `validate_matrix()` raises `SchemaError` on any column name/order mismatch before every `predict()` call |
 
-**Components**
-- **ExtraTrees** — 120 trees, `max_depth=30`, trained chunk-wise on a reduced
-  3-class target (`{0→0, 2→1, 3→2}`).
-- **XGBoost** — binary `normal` vs `attack` (`max_depth=10`, 500 estimators,
-  `lr=0.10`), trained incrementally across chunks.
+### Feature contract
 
-At inference, `MetaEnsembleModel` averages per-class probabilities across both
-estimators and maps the top class to a label.
+All 21 features are observable from live network flows — no synthesis, hashing, or
+imputation:
 
-**Known issues (be honest about these)**
-- **Label-space mismatch.** The runtime `CLASS_LABELS` map defines six classes
-  (`normal/attack/scanning/dos/injection/ddos`), but the checked-in ExtraTrees was
-  trained on a 3-class reduction and XGBoost is binary. The richer labels only
-  materialize if a correspondingly multi-class artifact is supplied. Treat
-  non-binary labels from the shipped artifact with caution.
-- **No checked-in held-out metrics.** `meta_train.py` does not emit a metrics file,
-  so this card cannot quote validated ensemble scores. Regenerate and record them
-  before relying on this model.
-- **Train/serve skew.** Live features are synthesized/hashed from sparse `tshark`
-  data (see [ADR-0005](../design-decisions/0005-feature-synthesis-for-sparse-telemetry.md)),
-  so the live input distribution differs from training.
-- **Portability bug in preprocessing.** `merge_and_clean.py` hard-codes an absolute
-  `DATA_DIR`; point it at your data before rerunning. *(Tracked cleanup item.)*
+```
+proto, duration, src_bytes, dst_bytes, total_bytes,
+src_pkts, dst_pkts, total_pkts,
+bytes_ratio, pkts_ratio,
+src_mean_pkt_size, dst_mean_pkt_size,
+bytes_per_sec, pkts_per_sec,
+dst_port_bucket,
+syn_count, ack_count, rst_count, fin_count, psh_count, urg_count
+```
 
----
+`src`/`dst` follow the canonical orientation rule: `src = endpoint with the lower
+(ip, port) tuple`. Both the corpus builder and the live scoring path call
+`canonicalize_orientation()` once per flow — the feature distribution is identical
+at training and serve time.
 
-## 2. Lightweight flow detector — `flow_detector.joblib` (fallback)
+### Training corpus
 
-| | |
-| --- | --- |
-| **Type** | `CalibratedClassifierCV` (isotonic) wrapping balanced `LogisticRegression` |
-| **Trainer** | `ml/train_flow_detector.py` |
-| **Training data** | UNSW-NB15 training/testing sets |
-| **Features** | Only what the live pipeline reliably collects: `total_bytes` (= `sbytes`+`dbytes`), `log_total_bytes`, and one-hot `proto` |
-| **Target** | Binary `label` (0 = normal, 1 = attack) |
-| **Selected at runtime** | Second — used when the meta artifact is absent |
+| Dataset | Flows | Attack% | Source |
+|---------|-------|---------|--------|
+| UNSW-NB15 | 2,058,890 | 3.22% | Jan 22 + Feb 17 2015 PCAPs |
+| Gotham Dataset 2025 | 2,331,227 | 97.05% | 5 attack categories |
+| CIC-IDS2017 Tuesday | 308,349 | 2.26% | FTP-Patator, SSH-Patator, Web attacks |
+| **Total** | **4,698,466** | **49.6%** | 3 distinct network environments |
 
-This model deliberately mirrors the *minimal* live feature set, so it suffers far
-less train/serve skew than the meta ensemble — at the cost of using only three
-features. Probabilities are calibrated, and decision thresholds are learned
-(`threshold_anomaly` ≈ 0.40 from best-F1 on validation; `threshold_watch` ≈ 0.26).
+### Performance (E3 pooled, 5-fold cross-validation hold-out)
 
-### Performance (`api/model_artifacts/flow_detector_metrics.json`)
+| Estimator | PR-AUC | Recall | Benign FPR |
+|-----------|--------|--------|-----------|
+| XGBoost | 1.0000 | 99.66% | 0.05% |
+| ExtraTrees | 1.0000 | 99.66% | 0.03% |
 
-| Metric | Validation | Test |
-| --- | --- | --- |
-| F1 | 0.838 | 0.730 |
-| Precision | 0.778 | 0.612 |
-| Recall | 0.908 | 0.904 |
-| Accuracy | 0.761 | 0.631 |
-| ROC-AUC | 0.849 | 0.792 |
-| PR-AUC | 0.916 | 0.823 |
+Cross-environment evaluation (models trained on subset, tested on held-out domain):
 
-**Reading these numbers:** the model is tuned for **high recall** (≈0.90 on test)
-at the expense of precision (≈0.61) — appropriate for a detector that prefers to
-flag-and-review rather than miss, but it will produce false positives. The
-validation→test drop reflects honest generalization on held-out data, not tuning
-to the test set.
+| Config | PR-AUC | Recall | Benign FPR | Notes |
+|--------|--------|--------|-----------|-------|
+| A in-domain Gotham | 1.000 | 99.58% | 0.01% | near-perfect |
+| A in-domain UNSW | 0.9998 | 99.94% | 0.03% | near-perfect |
+| B UNSW→Gotham | 0.9764 | 33.9% | 47.1% | cross-domain collapse |
+| B Gotham→UNSW | 0.3276 | 72.9% | 43.6% | cross-domain collapse |
+| E1 UNSW+Gotham→CIC | 0.1307 | 100% | 36.3% | unacceptable; calibration failure |
+| E2 CIC in-domain | 1.000 | 100% | 0.00% | near-perfect |
+| **E3 pooled all 3** | **1.000** | **99.66%** | **0.05%** | deployed config |
 
 ---
 
-## 3. Heuristic scorer — `FlowScorer` (last resort)
+## 2. Known limitations
 
-Rule-based score from byte volume, per-source burst rate, traffic direction
-(private↔public), protocol, and a small stable jitter (`api/scoring.py`). Requires
-no ML dependencies and runs whenever no artifacts are available. It is fully
-explainable and serves as both a baseline and the mode used by the test suite
-([ADR-0009](../design-decisions/0009-test-strategy-and-ci.md)).
+**Cross-domain generalization fails without pooling.** Single-environment or
+two-environment models collapse to 43–50% benign FPR on held-out network environments.
+Root cause: benign flow distributions shift dramatically across environments (bytes
+8–30×, packets 9× between UNSW and Gotham). Score ordering is good; calibration
+misfires at deployment prevalence. The three-way pool is the current mitigation —
+a fresh network environment would still require re-pooling with local benign data.
+
+**Payload-defined attacks have lower recall.** Categories where the attack signal
+lives in application-layer payload (Shellcode, Backdoor, CoAP-amplification) show
+lower recall than flow-stat attacks. The 21-feature contract is restricted to what
+a passive flow observer can measure — no deep-packet inspection.
+
+**`/simulate` scores 0.0.** The `/simulate` endpoint generates synthetic flows
+with a simplified feature format. `extra_to_feature_vector()` returns `None` for
+flows without the `_extractor: nfstream` marker, so simulated flows score 0.0.
+Real live-captured flows score correctly. Fix requires updating
+`generate_attack_flows()` in `api/app.py` to emit the 21-column NFStream contract.
+
+**No automated enforcement on real users.** Active-response endpoints are disabled
+by default and token-gated (ADR-0007). Do not wire model output to automatic
+blocking against real traffic.
 
 ---
 
-## Ethical and operational notes
+## 3. Absent-model behavior
 
-- **No automated enforcement on real users.** The active-response endpoints are
-  disabled by default and token-gated
-  ([ADR-0007](../design-decisions/0007-admin-token-gate-for-response-actions.md));
-  do not wire model output to automatic blocking against real traffic.
-- **Reverse-DNS** lookups send queries about observed peer IPs to a resolver; it is
-  configurable and stores only a presence flag/hash, not hostnames.
-- **Bias.** Detection quality reflects the public datasets used; performance on a
-  given network may differ substantially. Validate on representative data before
-  drawing conclusions.
+If `nfstream_model.joblib` is missing:
+- `NfstreamDetectionEngine` logs at `ERROR` level and sets `is_model_loaded = False`
+- `/capture/autostart` returns HTTP 503 — no silent no-scoring
+- `/model_status` reports `meta_model_status: "absent"`
+
+Run `git lfs pull` after clone (fetches the 102 MB artifact) or retrain with
+`python ml/train_nfstream.py`.
+
+---
 
 ## Reproducing
 
-See the **Training & Data Pipelines** section of the [README](../README.md) for
-exact commands to preprocess data and retrain both artifacts.
+See `CLAUDE.md` §5 for the exact corpus rebuild and training commands. Raw PCAPs
+(~15 GB) are required and are not redistributable. Corpus parquets (~120 MB) are
+not in git but are reproducible from the PCAPs.

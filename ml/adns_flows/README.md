@@ -20,7 +20,7 @@ bytes_per_sec, pkts_per_sec, dst_port_bucket,
 syn_count, ack_count, rst_count, fin_count, psh_count, urg_count
 ```
 
-All features are directly observed from tshark or arithmetic of observed values.
+All features are directly observed from NFStream or arithmetic of observed values.
 No Zeek-only fields, no hashing into invented ranges.
 
 ## Orientation rule
@@ -51,19 +51,14 @@ endpoint, that endpoint is pinned as src regardless of the default rule. If it
 matches neither, the default rule applies. Live capture always omits
 `prefer_src` so both paths use the same deterministic rule.
 
-### Why tshark's A-side is not the rule
+### Why NFStream's initiator-side is not the canonical rule
 
-tshark's conv output lists endpoints in `A <-> B` order based on which appeared
-first in the capture, not on any semantic property of the flow. The same
-physical flow processed in two different captures may produce opposite A-sides.
-`parse_conv_output()` therefore returns **neutral** endpoint names (`ep_a`,
-`ep_b`, `bytes_ab`, `bytes_ba`, `pkts_ab`, `pkts_ba`) with no src/dst naming.
-`assemble._make_flow()` calls `canonicalize_orientation()` once to assign src
-and dst, then assigns the directional byte/packet counts accordingly.
-
-Both tshark passes (conv stats and tcp.flags) join on `orientation_key` — the
-unordered `(min_ep, max_ep)` pair — so the join succeeds regardless of capture
-order.
+NFStream assigns `src`/`dst` based on which endpoint sent the first packet
+(initiator = src). This is non-deterministic across captures of the same flow
+in different directions. `extract_nfstream.py` therefore calls
+`canonicalize_orientation()` immediately after receiving each flow and swaps
+the directional counts if needed — the canonical rule always wins over
+NFStream's initiator assignment.
 
 ## Extraction — pcap file
 
@@ -71,68 +66,39 @@ order.
 # from the project root (ml/ on PYTHONPATH)
 python -m adns_flows --pcap capture.pcap --out flows.csv
 
-# with an explicit tshark path
-python -m adns_flows --pcap capture.pcap --out flows.csv \
-    --tshark "C:\Program Files\Wireshark\tshark.exe"
+# with multiple NFStream meter workers (default 1)
+python -m adns_flows --pcap capture.pcap --out flows.csv --n-meters 2
 ```
-
-## Extraction — live interface
-
-```bash
-python -m adns_flows --iface eth0 --window 60 --out flows.csv
-```
-
-`--window` is the capture duration in seconds (default 60). Two tshark passes
-run over the same window:
-
-- **Pass A** — `tshark -q -z conv,tcp -z conv,udp` → bidirectional byte/packet counts per conversation (neutral `ep_a`/`ep_b` names)
-- **Pass B** — `tshark -T fields -Y "ip && tcp" … -e tcp.flags` → per-flow TCP flag counts (keyed on `orientation_key`, direction-agnostic)
 
 ## Python API
 
 ```python
-from adns_flows import extract_flows, flows_to_dataframe, find_tshark, validate_matrix
-
-tshark = find_tshark()
+from adns_flows.extract_nfstream import extract_flows_nfstream, flows_to_dataframe_nfstream
+from adns_flows.schema import validate_matrix, FEATURE_COLUMNS, IDENTITY_COLUMNS
 
 # from a pcap
-flows = extract_flows(tshark, pcap="capture.pcap")
-df = flows_to_dataframe(flows)          # columns: IDENTITY_COLUMNS + FEATURE_COLUMNS
+flows = extract_flows_nfstream("capture.pcap")
+df = flows_to_dataframe_nfstream(flows)   # columns: IDENTITY_COLUMNS + FEATURE_COLUMNS
 
 # corpus building — pin attacker IP as src
-flows = extract_flows(tshark, pcap="attack.pcap", prefer_src="10.0.0.5")
+flows = extract_flows_nfstream("attack.pcap", prefer_src="10.0.0.5")
 
-# validate before scoring
-from adns_flows import FEATURE_COLUMNS
-validate_matrix(df, list(df.columns[len(IDENTITY_COLUMNS):]))   # raises SchemaError on drift
+# validate before scoring (raises SchemaError on column drift)
+validate_matrix(df[list(FEATURE_COLUMNS)], FEATURE_COLUMNS)
 ```
 
 ## Schema validation
 
 `validate_matrix(data, columns)` raises `SchemaError` if the column list does
-not exactly match `FEATURE_COLUMNS` in name and order. This replaces
-`MetaFeatureBuilder._match_shape`'s silent pad/truncate — the new pipeline
-fails loud so schema drift is caught at integration time.
+not exactly match `FEATURE_COLUMNS` in name and order. Called before every
+`model.predict()` in `serving_nfstream.NfstreamScorer.score_matrix()`.
 
 ## Running the tests
 
 ```bash
 # from the project root
 pytest ml/adns_flows/tests/ -v
-
-# pure-Python parsing and orientation tests only (no tshark required)
-pytest ml/adns_flows/tests/ -v -k "not tshark"
 ```
 
-tshark-dependent tests are automatically skipped when tshark is not on PATH
-and `TSHARK_BIN` is not set. The parsing, orientation, and schema validation
-tests run without tshark.
-
-## tshark binary resolution
-
-The module probes in this order (same as `api/app.py`):
-
-1. `sys._MEIPASS/tshark/tshark.exe` (PyInstaller bundle)
-2. `TSHARK_BIN` environment variable
-3. `C:\Program Files\Wireshark\tshark.exe` (Windows default)
-4. `shutil.which("tshark")` (PATH)
+All 131 tests run without tshark. NFStream is required (installed via
+`requirements-desktop.txt` or `api/requirements.txt`).

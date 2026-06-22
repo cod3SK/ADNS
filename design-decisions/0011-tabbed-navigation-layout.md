@@ -29,7 +29,7 @@ named tabs that each own a single conceptual area:
 | **Dashboard** | Signal summary metric cards + four charts (anomalous flows, threat timeline, severity mix donut, anomaly score over recent flows) |
 | **Flows** | Filterable recent-flows table with per-row block action |
 | **Flows Manager** | Anomalous flow list + blocked IPs with unblock actions |
-| **Settings** | Capture pipeline (tshark status, interface selector, start/stop) |
+| **Settings** | Capture pipeline (NFStream extractor status, interface, flow/batch counts), model health, timezone, version |
 
 The kill switch button stays in the top header outside the tab system because it is
 a global emergency control that must be reachable from any context.
