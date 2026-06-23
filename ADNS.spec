@@ -49,8 +49,14 @@ a = Analysis(
         # /capture/autostart with HTTP 503 (not silent).  See api/model_runner.py.
         # nfstream_model.joblib is tracked via Git LFS; run `git lfs pull` after clone.
         ("api/model_artifacts", "model_artifacts"),
-        # Flask app source files (all modules in api/)
+        # Corpus parquets bundled for offline calibration (stage 4 retrain).
+        # pipeline.py resolves these at sys._MEIPASS/corpus/ in the frozen exe.
+        ("outputs/corpus/unsw_flows.parquet",        "corpus"),
+        ("outputs/corpus/gotham_flows.parquet",      "corpus"),
+        ("outputs/corpus/cic_tuesday_flows.parquet", "corpus"),
+        # Flask app source files (all modules in api/ and calibration sub-package)
         ("api/*.py", "api"),
+        ("api/calibration/*.py", "api/calibration"),
         # App icon (used by the desktop shortcut)
         ("assets/icon.ico", "assets"),
     ] + sklearn_datas + webview_datas + pystray_datas + xgboost_datas
@@ -82,10 +88,15 @@ a = Analysis(
         "adns_flows.schema",
         "adns_flows.extract_nfstream",
         "adns_flows.nfstream_config",
-        "adns_flows.extract",
-        "adns_flows.assemble",
         # NFStream serving module (api/ data file, imports not auto-traced)
         "serving_nfstream",
+        # Calibration pipeline (api/calibration/ sub-package)
+        "calibration",
+        "calibration.pipeline",
+        "calibration.whitelist",
+        # Additional api/ modules (data files, not auto-traced)
+        "calibration_routes",
+        "scan_flood_detector",
         # NFStream sub-modules (collect_all may miss lazy-imported ones)
         "nfstream",
         "nfstream.streamer",

@@ -29,20 +29,17 @@
 ;     How    : pyinstaller ADNS.spec --clean
 ;     Contains (all bundled automatically by PyInstaller):
 ;       ADNS.exe                      main executable
-;       _internal\tshark\tshark.exe   packet capture engine
-;       _internal\tshark\dumpcap.exe  low-level capture helper
-;       _internal\tshark\*.dll        ~50 Wireshark support DLLs
 ;       _internal\VCRUNTIME140.dll    VC++ runtime (no separate
 ;       _internal\MSVCP140.dll          redist installer needed)
 ;       _internal\api\                Flask app source modules
 ;       _internal\dist\               React production build
-;       _internal\model_artifacts\    trained ML models (.joblib)
+;       _internal\model_artifacts\    nfstream_model.joblib (101 MB, Git LFS)
+;       _internal\corpus\             corpus parquets for calibration retrain
 ;       _internal\npcap-installer.exe copied from repo root by spec
 ;
 ; -- Already present in repo (not generated) --
 ;
-;   api\model_artifacts\flow_detector.joblib
-;   api\model_artifacts\meta_model_combined.joblib
+;   api\model_artifacts\nfstream_model.joblib   (Git LFS; run: git lfs pull)
 ;   api\model_artifacts\flow_detector_metrics.json
 ;
 ; ============================================================

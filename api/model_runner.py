@@ -54,6 +54,16 @@ class NfstreamDetectionEngine:
     def model_error(self) -> "str | None":
         return self._model_error
 
+    def reload(self, model_path: "str | Path | None" = None) -> None:
+        """Hot-reload the model from disk. Called after calibration swaps the file."""
+        self._scorer = None
+        self._model_error = None
+        self._load(model_path)
+        if self._scorer is not None:
+            logger.info("NfstreamDetectionEngine: model reloaded successfully")
+        else:
+            logger.error("NfstreamDetectionEngine: reload failed — %s", self._model_error)
+
     def score_many(self, flows: Sequence) -> list[Tuple[float, str]]:
         """Score a batch of DB Flow objects using contract features from flow.extra."""
         if not flows:

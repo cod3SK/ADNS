@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from app import Flow, Prediction, app, db
 from model_runner import NfstreamDetectionEngine
 from rdns import ReverseDNSResolver
+from scan_flood_detector import detector as _scan_flood_detector
 
 logger = logging.getLogger(__name__)
 nfstream_detector = NfstreamDetectionEngine()
@@ -25,29 +26,6 @@ RDNS_CACHE_TTL = float(os.environ.get("ADNS_RDNS_CACHE_TTL", "900"))
 RDNS_CACHE_SIZE = int(os.environ.get("ADNS_RDNS_CACHE_SIZE", "500"))
 resolver = ReverseDNSResolver(cache_ttl=RDNS_CACHE_TTL, cache_size=RDNS_CACHE_SIZE, timeout=RDNS_TIMEOUT) if RDNS_ENABLED else None
 
-
-def _infer_scanning(flow) -> str | None:
-    """
-    Lightweight heuristic: flows with explicit scan service or low-bytes hits to many ports
-    default to scanning when the model says normal/watch.
-    """
-    extra = flow.extra or {}
-    service = str(extra.get("service", "")).lower()
-    if "scan" in service:
-        return "scanning"
-    try:
-        dst_port = int(extra.get("dst_port") or 0)
-    except (TypeError, ValueError):
-        dst_port = 0
-    try:
-        src_port = int(extra.get("src_port") or 0)
-    except (TypeError, ValueError):
-        src_port = 0
-    bytes_total = float(flow.bytes or 0.0)
-    if (dst_port and dst_port <= 1024) or (src_port and src_port <= 1024):
-        if bytes_total <= 20000:
-            return "scanning"
-    return None
 
 
 def _chunked(ids: Sequence[int], size: int) -> Iterable[list[int]]:
@@ -149,7 +127,7 @@ def score_flow_batch(flow_ids: Sequence[int]) -> int:
                     elif attack_label and label and label.lower() != "normal":
                         candidate_attack = attack_label
                     elif label and label.lower() in {"normal", "watch"}:
-                        candidate_attack = _infer_scanning(flow)
+                        candidate_attack = _scan_flood_detector.record_and_classify(flow)
 
                     extras = dict(flow.extra or {})
                     if candidate_attack and candidate_attack.lower() not in base_labels:

@@ -19,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import numpy as np
 from model_runner import NfstreamDetectionEngine
+from scan_flood_detector import detector as _scan_flood_detector
 from task_queue import enqueue_flow_scoring
 from serving_nfstream import flow_to_extra
 
@@ -409,29 +410,6 @@ def block_ip_os(ip: str, allow: bool = False) -> tuple[bool, str]:
 
 _simulation_scorer = NfstreamDetectionEngine()
 
-
-def _infer_scanning(flow) -> str | None:
-    """
-    Lightweight heuristic to nudge likely port scans when the model is neutral.
-    Looks for 'scan' service hint or low-byte hits to privileged ports.
-    """
-    extra = flow.extra or {}
-    service = str(extra.get("service", "")).lower()
-    if "scan" in service:
-        return "scanning"
-    try:
-        dst_port = int(extra.get("dst_port") or 0)
-    except (TypeError, ValueError):
-        dst_port = 0
-    try:
-        src_port = int(extra.get("src_port") or 0)
-    except (TypeError, ValueError):
-        src_port = 0
-    bytes_total = float(flow.bytes or 0.0)
-    if (dst_port and dst_port <= 1024) or (src_port and src_port <= 1024):
-        if bytes_total <= 20000:
-            return "scanning"
-    return None
 
 SIMULATION_TYPES = {
     "attack": {
@@ -1262,7 +1240,7 @@ def simulate_attack():
                             if label and label.lower() not in base_labels:
                                 candidate_attack = label
                             elif label and label.lower() in {"normal", "watch"}:
-                                candidate_attack = _infer_scanning(flow)
+                                candidate_attack = _scan_flood_detector.record_and_classify(flow)
                             extras = dict(flow.extra or {})
                             if candidate_attack and candidate_attack.lower() not in base_labels:
                                 extras["attack_type"] = candidate_attack
@@ -1319,7 +1297,7 @@ def simulate_attack():
         if label and label.lower() not in base_labels:
             candidate_attack = label
         elif label and label.lower() in {"normal", "watch"}:
-            candidate_attack = _infer_scanning(flow)
+            candidate_attack = _scan_flood_detector.record_and_classify(flow)
         extras = dict(flow.extra or {})
         if candidate_attack and candidate_attack.lower() not in base_labels:
             extras["attack_type"] = candidate_attack
@@ -1812,6 +1790,15 @@ def batch_summary():
 
 
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Calibration blueprint
+# ---------------------------------------------------------------
+try:
+    from calibration_routes import calibration_bp
+    app.register_blueprint(calibration_bp)
+except Exception as _cal_err:  # pragma: no cover — optional feature
+    app.logger.warning("calibration blueprint not loaded: %s", _cal_err)
+
 # Frontend static file serving (desktop / self-contained mode)
 # Set ADNS_FRONTEND_DIST to the React dist/ directory to enable.
 # In dev mode the Vite dev server handles this; this route is a no-op.

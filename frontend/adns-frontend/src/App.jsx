@@ -87,6 +87,10 @@ export default function App() {
   const [batchWindow, setBatchWindow] = useState("10m");
   const [batchSummary, setBatchSummary] = useState(null);
   const [batchLoading, setBatchLoading] = useState(true);
+  const [calStatus, setCalStatus] = useState(null);
+  const [calFirstRun, setCalFirstRun] = useState(null);
+  const [calBusy, setCalBusy] = useState(false);
+  const [showCalPrompt, setShowCalPrompt] = useState(false);
 
   const saveTimezone = (tz) => {
     setTimezone(tz);
@@ -217,6 +221,74 @@ export default function App() {
     const id = setInterval(fetchModelStatus, 10000);
     return () => clearInterval(id);
   }, [fetchModelStatus]);
+
+  // Calibration status — poll every 3 s when on settings tab or running
+  const fetchCalStatus = useCallback(async () => {
+    try {
+      const r = await api.get("/calibration/status");
+      setCalStatus(r.data);
+    } catch { /* optional feature — degrade silently */ }
+  }, []);
+
+  const fetchCalFirstRun = useCallback(async () => {
+    try {
+      const r = await api.get("/calibration/first_run_check");
+      setCalFirstRun(r.data);
+      if (r.data?.suggest_calibration) setShowCalPrompt(true);
+    } catch { /* optional */ }
+  }, []);
+
+  useEffect(() => {
+    fetchCalFirstRun();
+  }, [fetchCalFirstRun]);
+
+  useEffect(() => {
+    const isActive = calStatus?.stage && calStatus.stage !== "idle";
+    if (activeTab === "settings" || isActive) {
+      fetchCalStatus();
+      const id = setInterval(fetchCalStatus, 3000);
+      return () => clearInterval(id);
+    }
+  }, [fetchCalStatus, activeTab, calStatus?.stage]);
+
+  const startCalibration = async () => {
+    if (!captureStatus?.interface?.device) return;
+    setCalBusy(true);
+    try {
+      await api.post("/calibration/start", {
+        interface: captureStatus.interface.device,
+        capture_duration: 1800,
+      });
+      await fetchCalStatus();
+    } catch (err) {
+      console.error("calibration start failed", err);
+    } finally {
+      setCalBusy(false);
+    }
+  };
+
+  const cancelCalibration = async () => {
+    try { await api.post("/calibration/cancel"); } catch { /* ignore */ }
+    await fetchCalStatus();
+  };
+
+  const resetCalibration = async () => {
+    try { await api.post("/calibration/reset"); } catch { /* ignore */ }
+    await fetchCalStatus();
+  };
+
+  const revertCalibration = async () => {
+    setCalBusy(true);
+    try {
+      await api.post("/calibration/revert");
+      await api.post("/calibration/reload_model");
+      await fetchCalStatus();
+    } catch (err) {
+      console.error("revert failed", err);
+    } finally {
+      setCalBusy(false);
+    }
+  };
 
   const toggleKillSwitch = async () => {
     setKillBusy(true);
@@ -975,6 +1047,26 @@ export default function App() {
                 </div>
               </section>
 
+              {/* ── Network Calibration panel ── */}
+              <section className="panel">
+                <div className="panel-heading">
+                  <div className="panel-title-group">
+                    <h3>Network Calibration</h3>
+                    <p>Retrain the model on your local benign traffic to reduce false alerts.</p>
+                  </div>
+                </div>
+                <CalibrationPanel
+                  calStatus={calStatus}
+                  calFirstRun={calFirstRun}
+                  calBusy={calBusy}
+                  captureStatus={captureStatus}
+                  onStart={startCalibration}
+                  onCancel={cancelCalibration}
+                  onReset={resetCalibration}
+                  onRevert={revertCalibration}
+                />
+              </section>
+
               <section className="panel">
                 <div className="panel-heading">
                   <div className="panel-title-group">
@@ -1012,6 +1104,39 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {/* ── First-run calibration prompt ── */}
+      {showCalPrompt && calStatus?.stage === "idle" && (
+        <div className="modal-overlay">
+          <div className="modal-box" style={{maxWidth: 480}}>
+            <h2 style={{marginTop: 0}}>Calibrate ADNS to your network</h2>
+            <p style={{color:"#374151",lineHeight:1.6}}>
+              ADNS was trained on lab network data. Your network likely has different
+              traffic patterns (mDNS, SSDP, local DHCP), which can cause false alerts.
+            </p>
+            <p style={{color:"#374151",lineHeight:1.6}}>
+              Calibration captures <strong>30 minutes</strong> of your normal traffic,
+              retrains the model to recognise it as benign, and validates the result
+              before activating. False-alert rates typically drop from ~30% to &lt;5%.
+            </p>
+            <p style={{fontSize:"0.85rem",color:"#6b7280"}}>
+              Total time: ~35 min (30 min capture + ~5 min retrain).
+              You can skip and calibrate later from Settings.
+            </p>
+            <div style={{display:"flex",gap:10,marginTop:20,justifyContent:"flex-end"}}>
+              <button className="btn-secondary" onClick={() => setShowCalPrompt(false)}>
+                Skip for now
+              </button>
+              <button
+                className="btn-primary"
+                onClick={() => { setShowCalPrompt(false); setActiveTab("settings"); }}
+              >
+                Calibrate
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1035,6 +1160,150 @@ function Td({ children, clamp = true, className }) {
     <td className={className}>
       <span className="cell-text">{children}</span>
     </td>
+  );
+}
+
+// ── Calibration panel component ───────────────────────────────────────────────
+
+const STAGE_LABELS = {
+  idle:       "Ready",
+  capturing:  "Capturing traffic...",
+  extracting: "Extracting flows...",
+  filtering:  "Filtering benign flows...",
+  retraining: "Retraining model...",
+  validating: "Validating gates...",
+  done:       "Calibration complete",
+  failed:     "Calibration failed",
+};
+
+function CalibrationPanel({ calStatus, calFirstRun, calBusy, captureStatus, onStart, onCancel, onReset, onRevert }) {
+  const stage    = calStatus?.stage ?? "idle";
+  const progress = calStatus?.progress ?? 0;
+  const message  = calStatus?.message ?? "";
+  const error    = calStatus?.error;
+  const result   = calStatus?.result;
+  const isRunning = !["idle", "done", "failed"].includes(stage);
+  const canStart  = stage === "idle" && captureStatus?.interface?.device;
+
+  const secsRemaining = calStatus?.capture_seconds_remaining;
+  const timeLabel = secsRemaining != null
+    ? `${Math.floor(secsRemaining / 60)}:${String(secsRemaining % 60).padStart(2, "0")} remaining`
+    : null;
+
+  return (
+    <div className="pipeline-indicators">
+
+      {/* Status row */}
+      <div className="pipeline-row">
+        <span className="pipeline-label">Status</span>
+        <span className={`status-dot ${
+          stage === "done"    ? "dot-ok"
+          : stage === "failed" ? "dot-err"
+          : isRunning          ? "dot-warn"
+          : "dot-idle"
+        }`} />
+        <span className="pipeline-value">{STAGE_LABELS[stage] ?? stage}</span>
+      </div>
+
+      {calFirstRun?.calibrated_model_exists && (
+        <div className="pipeline-row">
+          <span className="pipeline-label">Model</span>
+          <span className="status-dot dot-ok" />
+          <span className="pipeline-value">Calibrated to this network</span>
+        </div>
+      )}
+
+      {/* Progress bar (during active run) */}
+      {isRunning && (
+        <>
+          <div style={{margin:"10px 0 4px",background:"#e5e7eb",borderRadius:6,height:8,overflow:"hidden"}}>
+            <div style={{width:`${progress}%`,background:"#3b82f6",height:"100%",transition:"width 0.4s"}} />
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:"0.78rem",color:"#6b7280"}}>
+            <span>{message}</span>
+            {timeLabel && <span>{timeLabel}</span>}
+            {calStatus?.flows_captured > 0 && (
+              <span>{calStatus.flows_captured.toLocaleString()} flows captured</span>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* Success summary */}
+      {stage === "done" && result && (
+        <div style={{marginTop:10,padding:"10px 12px",background:"#f0fdf4",borderRadius:6,border:"1px solid #bbf7d0",fontSize:"0.83rem",color:"#166534"}}>
+          <div><strong>Calibration complete</strong></div>
+          <div style={{marginTop:4,lineHeight:1.7}}>
+            {result.flows_kept != null && <div>Benign flows used: {result.flows_kept.toLocaleString()}</div>}
+            {result.local_fpr_pct != null && <div>False-alert rate on your traffic: {result.local_fpr_pct.toFixed(1)}%</div>}
+            {result.corpus_recall_pct != null && <div>Attack recall maintained: {result.corpus_recall_pct.toFixed(1)}%</div>}
+            {result.outlier_warning && (
+              <div style={{color:"#b45309",marginTop:4}}>
+                Warning: high outlier drop rate — unusual traffic detected during calibration window.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Error summary */}
+      {stage === "failed" && error && (
+        <div style={{marginTop:10,padding:"10px 12px",background:"#fef2f2",borderRadius:6,border:"1px solid #fecaca",fontSize:"0.83rem",color:"#991b1b"}}>
+          <strong>Pipeline failed:</strong> {error}
+        </div>
+      )}
+
+      {/* Action buttons */}
+      <div style={{display:"flex",gap:8,marginTop:12,flexWrap:"wrap"}}>
+        {canStart && (
+          <button className="btn-primary" onClick={onStart} disabled={calBusy}>
+            {calFirstRun?.calibrated_model_exists ? "Re-calibrate" : "Start calibration"}
+          </button>
+        )}
+        {!canStart && stage === "idle" && (
+          <span style={{fontSize:"0.82rem",color:"#6b7280"}}>
+            Start network capture first (Settings → Capture pipeline).
+          </span>
+        )}
+        {isRunning && stage === "capturing" && (
+          <button className="btn-secondary" onClick={onCancel} disabled={calBusy}>
+            Cancel
+          </button>
+        )}
+        {["done", "failed"].includes(stage) && (
+          <button className="btn-secondary" onClick={onReset}>
+            Dismiss
+          </button>
+        )}
+        {stage === "failed" && (
+          <button className="btn-secondary" onClick={onRevert} disabled={calBusy}>
+            Revert to original model
+          </button>
+        )}
+        {stage === "done" && calFirstRun?.calibrated_model_exists && (
+          <button className="btn-secondary" onClick={onRevert} disabled={calBusy}>
+            Revert to original model
+          </button>
+        )}
+      </div>
+
+      {/* Guided capture instructions — shown when calibration not yet started */}
+      {stage === "idle" && !calFirstRun?.calibrated_model_exists && (
+        <div style={{marginTop:14,padding:"10px 12px",background:"#eff6ff",borderRadius:6,border:"1px solid #bfdbfe",fontSize:"0.82rem",color:"#1e40af"}}>
+          <strong>During the 30-minute capture, please:</strong>
+          <ul style={{margin:"6px 0 0 16px",padding:0,lineHeight:1.8}}>
+            <li>Browse 2–3 normal websites (news, email, etc.)</li>
+            <li>Check email or refresh feeds</li>
+            <li>Let background apps run normally (Slack, system updates)</li>
+          </ul>
+          <strong style={{display:"block",marginTop:8}}>Avoid:</strong>
+          <ul style={{margin:"4px 0 0 16px",padding:0,lineHeight:1.8}}>
+            <li>Large downloads, torrents, or VPNs</li>
+            <li>Port scans or network diagnostic tools</li>
+          </ul>
+        </div>
+      )}
+    </div>
   );
 }
 
