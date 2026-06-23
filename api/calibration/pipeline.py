@@ -30,19 +30,37 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
-_ROOT = Path(__file__).resolve().parent.parent.parent   # project root
+# ── Paths (freeze-aware) ──────────────────────────────────────────────────────
+# In the frozen exe (PyInstaller), __file__ resolves to a read-only location
+# inside sys._MEIPASS.  Writable artifacts (calibrated model, capture PCAP)
+# must go to %APPDATA%\ADNS instead.  Corpus parquets are bundled in the exe
+# at sys._MEIPASS/corpus/ so calibration works offline.
+_FROZEN = getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
 
-CORPUS_PATHS: dict[str, Path] = {
-    "unsw":   _ROOT / "outputs" / "corpus" / "unsw_flows.parquet",
-    "gotham": _ROOT / "outputs" / "corpus" / "gotham_flows.parquet",
-    "cic":    _ROOT / "outputs" / "corpus" / "cic_tuesday_flows.parquet",
-}
-MODEL_PATH        = _ROOT / "api" / "model_artifacts" / "nfstream_model.joblib"
-CALIBRATED_PATH   = _ROOT / "api" / "model_artifacts" / "nfstream_model_calibrated.joblib"
-INSTANCE_DIR      = _ROOT / "api" / "instance"
-CAPTURE_PCAP      = INSTANCE_DIR / "calibration_traffic.pcap"
-CALIBRATION_CSV   = INSTANCE_DIR / "calibration_flows.csv"
+if _FROZEN:
+    _MEIPASS = Path(sys._MEIPASS)
+    _APPDATA = Path(os.environ.get("APPDATA") or Path.home()) / "ADNS"
+    MODEL_PATH      = _MEIPASS / "model_artifacts" / "nfstream_model.joblib"
+    CALIBRATED_PATH = _APPDATA / "nfstream_model_calibrated.joblib"
+    INSTANCE_DIR    = _APPDATA / "instance"
+    CORPUS_PATHS: dict[str, Path] = {
+        "unsw":   _MEIPASS / "corpus" / "unsw_flows.parquet",
+        "gotham": _MEIPASS / "corpus" / "gotham_flows.parquet",
+        "cic":    _MEIPASS / "corpus" / "cic_tuesday_flows.parquet",
+    }
+else:
+    _ROOT = Path(__file__).resolve().parent.parent.parent
+    MODEL_PATH      = _ROOT / "api" / "model_artifacts" / "nfstream_model.joblib"
+    CALIBRATED_PATH = _ROOT / "api" / "model_artifacts" / "nfstream_model_calibrated.joblib"
+    INSTANCE_DIR    = _ROOT / "api" / "instance"
+    CORPUS_PATHS: dict[str, Path] = {
+        "unsw":   _ROOT / "outputs" / "corpus" / "unsw_flows.parquet",
+        "gotham": _ROOT / "outputs" / "corpus" / "gotham_flows.parquet",
+        "cic":    _ROOT / "outputs" / "corpus" / "cic_tuesday_flows.parquet",
+    }
+
+CAPTURE_PCAP    = INSTANCE_DIR / "calibration_traffic.pcap"
+CALIBRATION_CSV = INSTANCE_DIR / "calibration_flows.csv"
 
 # ── Retrain hyper-parameters ──────────────────────────────────────────────────
 ATTACK_SAMPLE_PER_CORPUS = 33_000  # ~100 k total across three corpora
@@ -123,12 +141,25 @@ def reset_pipeline() -> None:
 
 
 def revert_model() -> None:
-    """Restore the backed-up pre-calibration model (if present)."""
-    backup = MODEL_PATH.with_suffix(".joblib.backup")
-    if not backup.exists():
-        raise FileNotFoundError(f"No backup found at {backup}")
-    shutil.copy2(str(backup), str(MODEL_PATH))
-    log.info("model reverted from backup: %s -> %s", backup, MODEL_PATH)
+    """Restore the pre-calibration model.
+
+    Frozen exe: the bundled base model is always present at MODEL_PATH (read-only,
+    never overwritten).  Revert by deleting CALIBRATED_PATH from AppData so the
+    serving engine falls back to the bundled model on the next reload.
+
+    Dev mode: restore from the .joblib.backup written during calibration.
+    """
+    if _FROZEN:
+        if not CALIBRATED_PATH.exists():
+            raise FileNotFoundError("No calibrated model to revert (not yet calibrated).")
+        CALIBRATED_PATH.unlink()
+        log.info("reverted: deleted calibrated model at %s", CALIBRATED_PATH)
+    else:
+        backup = MODEL_PATH.with_suffix(".joblib.backup")
+        if not backup.exists():
+            raise FileNotFoundError(f"No backup found at {backup}")
+        shutil.copy2(str(backup), str(MODEL_PATH))
+        log.info("model reverted from backup: %s -> %s", backup, MODEL_PATH)
 
 
 # ── Private: pipeline orchestration ──────────────────────────────────────────
@@ -151,10 +182,13 @@ def _run(interface: str, capture_duration: int, tshark_bin: str | None) -> None:
     try:
         INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Ensure ml/ is importable
-        ml_path = str(_ROOT / "ml")
-        if ml_path not in sys.path:
-            sys.path.insert(0, ml_path)
+        # In dev mode, add ml/ to sys.path so adns_flows is importable.
+        # In the frozen exe adns_flows is already compiled into the bundle.
+        if not _FROZEN:
+            _root = Path(__file__).resolve().parent.parent.parent
+            ml_path = str(_root / "ml")
+            if ml_path not in sys.path:
+                sys.path.insert(0, ml_path)
 
         pcap_path = _stage_capture(interface, capture_duration, tshark_bin)
         if _cancelled():
@@ -448,14 +482,20 @@ def _stage_validate(model_path: Path, benign_df: pd.DataFrame, retrain_result: d
 
     _upd("Gate 5D: corpus recall maintained.", progress=98)
 
-    # All gates passed — back up old model and activate calibrated model
-    backup = MODEL_PATH.with_suffix(".joblib.backup")
-    if MODEL_PATH.exists():
-        shutil.copy2(str(MODEL_PATH), str(backup))
-        log.info("backed up original model to %s", backup)
-
-    shutil.copy2(str(model_path), str(MODEL_PATH))
-    log.info("calibrated model activated: %s -> %s", model_path.name, MODEL_PATH.name)
+    # All gates passed — activate the calibrated model.
+    if _FROZEN:
+        # Frozen exe: MODEL_PATH (bundled) is read-only.  CALIBRATED_PATH is already
+        # written to AppData by _stage_retrain.  _do_reload() in calibration_routes
+        # will pick it up (CALIBRATED_PATH exists → preferred over bundled model).
+        log.info("frozen exe: calibrated model activated at %s", CALIBRATED_PATH)
+    else:
+        # Dev: back up base model and copy calibrated over it in-place.
+        backup = MODEL_PATH.with_suffix(".joblib.backup")
+        if MODEL_PATH.exists():
+            shutil.copy2(str(MODEL_PATH), str(backup))
+            log.info("backed up original model to %s", backup)
+        shutil.copy2(str(model_path), str(MODEL_PATH))
+        log.info("calibrated model activated: %s -> %s", model_path.name, MODEL_PATH.name)
 
     # Persist final result
     with _LOCK:

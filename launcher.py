@@ -37,6 +37,21 @@ def _data_dir() -> str:
     return path
 
 
+def _setup_logging(data_dir: str) -> None:
+    import logging
+    import logging.handlers
+    log_path = os.path.join(data_dir, "adns.log")
+    handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
+
+
 class _StripApiPrefix:
     """WSGI middleware that strips the /api prefix before routing to Flask."""
 
@@ -305,6 +320,7 @@ def main() -> None:
         _ensure_npcap()
 
     data_dir = _data_dir()
+    _setup_logging(data_dir)
 
     if _port_in_use(5000) and not _reclaim_port(5000):
         _fatal(

@@ -12,17 +12,12 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 from flask import Blueprint, jsonify, request
 
 log = logging.getLogger(__name__)
 
 calibration_bp = Blueprint("calibration", __name__, url_prefix="/calibration")
-
-# Resolved lazily so the blueprint can be imported without circular deps.
-_MODEL_PATH = Path(__file__).parent / "model_artifacts" / "nfstream_model.joblib"
-_CALIBRATED_PATH = Path(__file__).parent / "model_artifacts" / "nfstream_model_calibrated.joblib"
 
 
 # ── Status ─────────────────────────────────────────────────────────────────────
@@ -105,11 +100,19 @@ def cal_reload():
 
 
 def _do_reload() -> None:
-    """Call reload() on every NfstreamDetectionEngine instance in the process."""
+    """Reload every NfstreamDetectionEngine with the currently active model.
+
+    Prefers the calibrated model if it exists (AppData in frozen exe, or
+    api/model_artifacts/ in dev), otherwise uses the base bundled model.
+    """
+    from calibration.pipeline import CALIBRATED_PATH, MODEL_PATH
+    active = str(CALIBRATED_PATH) if CALIBRATED_PATH.exists() else str(MODEL_PATH)
+    log.info("reloading detection engines with %s", active)
+
     try:
         import tasks as tasks_mod
         if hasattr(tasks_mod, "nfstream_detector"):
-            tasks_mod.nfstream_detector.reload()
+            tasks_mod.nfstream_detector.reload(active)
             log.info("tasks.nfstream_detector reloaded")
     except Exception as exc:
         log.warning("tasks engine reload failed: %s", exc)
@@ -117,7 +120,7 @@ def _do_reload() -> None:
     try:
         import app as app_mod
         if hasattr(app_mod, "_simulation_scorer"):
-            app_mod._simulation_scorer.reload()
+            app_mod._simulation_scorer.reload(active)
             log.info("app._simulation_scorer reloaded")
     except Exception as exc:
         log.warning("app scorer reload failed: %s", exc)
@@ -130,9 +133,11 @@ def cal_first_run_check():
     """Returns whether a calibrated model already exists.
 
     Used by the frontend to decide whether to show the first-run calibration prompt.
+    Paths are freeze-aware (imported from calibration.pipeline).
     """
-    calibrated_exists = _CALIBRATED_PATH.exists()
-    base_exists       = _MODEL_PATH.exists()
+    from calibration.pipeline import CALIBRATED_PATH, MODEL_PATH
+    calibrated_exists = CALIBRATED_PATH.exists()
+    base_exists       = MODEL_PATH.exists()
     return jsonify({
         "calibrated_model_exists": calibrated_exists,
         "base_model_exists":       base_exists,
