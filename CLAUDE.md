@@ -529,3 +529,41 @@ Final cutover — all tshark dead code removed. Order of operations:
 
 Detailed migration plan: `memory/ml_next_steps.md` +
 `memory/nfstream_phase0.md` (Claude auto-memory, loaded at session start).
+
+**Deployment-time calibration — COMPLETE (2026-06-23, branch feat/scan-flood-detector)**
+
+Diagnostic (`diag_pipeline.py`) confirmed a 30.77% FPR on real home-network traffic
+(39 flows, 30 s capture). Root cause: mDNS (port 5353), DHCP, SSDP — protocols absent
+from all three training corpora. Model scores correctly otherwise (attacks → 1.0000,
+TCP web traffic → low). The threshold-only `feat/per-network-calibration` approach was
+insufficient; full retrain with local benign is the fix.
+
+New files (commit b88c8de):
+- `api/calibration/__init__.py` — package init
+- `api/calibration/pipeline.py` — 5-stage retrain daemon:
+  1. Capture (tshark, default 1800 s, cancel-safe)
+  2. Extract (NFStream serve-time config — same as live scoring)
+  3. Filter (protocol whitelist `SAFE_PORTS` + IQR outlier drop)
+  4. Retrain (XGBoost 300 trees + ExtraTrees 200 trees on ~100 k corpus attacks + local benign)
+  5. Validate (Gates 5A load / 5B attack score >0.80 / 5C local FPR <5% / 5D corpus recall >90%)
+     → swap model on pass, revert on fail
+- `api/calibration/whitelist.py` — `SAFE_PORTS` frozenset (30+ entries), `apply_whitelist()`,
+  `apply_outlier_drop()` (IQR-based; robust where mean+3σ fails on extreme single outliers)
+- `api/calibration_routes.py` — Flask Blueprint `/calibration/*`: status, start, cancel, reset,
+  revert, reload_model, first_run_check (7 endpoints)
+- `api/tests/test_calibration_pipeline.py` — 28 tests (whitelist ×9, outlier ×6, state ×5, routes ×8)
+
+Modified:
+- `api/model_runner.py` — `NfstreamDetectionEngine.reload()` for hot-model-swap without restart
+- `api/app.py` — blueprint registration (try/except; optional)
+- `frontend/adns-frontend/src/App.jsx` — `CalibrationPanel` in Settings tab, first-run opt-in modal
+- `frontend/adns-frontend/src/App.css` — btn-primary, btn-secondary, modal-overlay, modal-box CSS
+
+**169 tests passing** (28 new + 131 prior).
+
+Open items:
+- Corpus parquets (`outputs/corpus/*.parquet`) are required for Stage 4 retrain; they are
+  not included in the frozen exe. A production path (bundle-at-build or download-on-first-run)
+  is not yet designed.
+- Scan-flood-detector (stateful per-IP aggregation for port-scan + SYN-flood heuristics,
+  replacing `_infer_scanning` in `api/tasks.py`) is not yet implemented.
