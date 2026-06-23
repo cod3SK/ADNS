@@ -1812,6 +1812,15 @@ def batch_summary():
 
 
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Calibration blueprint
+# ---------------------------------------------------------------
+try:
+    from calibration_routes import calibration_bp
+    app.register_blueprint(calibration_bp)
+except Exception as _cal_err:  # pragma: no cover — optional feature
+    app.logger.warning("calibration blueprint not loaded: %s", _cal_err)
+
 # Frontend static file serving (desktop / self-contained mode)
 # Set ADNS_FRONTEND_DIST to the React dist/ directory to enable.
 # In dev mode the Vite dev server handles this; this route is a no-op.
